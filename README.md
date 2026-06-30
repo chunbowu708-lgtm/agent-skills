@@ -8,8 +8,10 @@
 
 | Skill | 用途 | 语言/依赖 |
 |-------|------|-----------|
-| [**collect-resumes**](skills/collect-resumes) | 从邮箱扫描简历邮件，按岗位归档到本地文件夹（附件下载 + 链接类附件抓取 + 多邮件合并） | Node.js，配合飞书 mail API |
-| [**recruit-followup**](skills/recruit-followup) | 招聘跟进全流程：候选人录入飞书招聘、邀约信号扫描、面评同步、跟踪表自动更新 | 飞书 hire/document_ai/im/base API |
+| [**collect-resumes**](skills/collect-resumes) | 从邮箱扫描简历邮件，按岗位归档到本地文件夹（附件下载 + 链接类附件抓取 + 多邮件合并 + 薪酬脱敏） | Node.js，配合飞书 mail API |
+| [**analyze-resumes**](skills/analyze-resumes) | 对归档简历做 AI 5维评估，产出强推/可推/待定/不推四档判定 + 业务推荐摘要 | Python + AI，配合飞书 document_ai |
+| [**recruit-followup**](skills/recruit-followup) | 招聘跟进全流程：候选人录入飞书招聘、邀约信号扫描、面评同步、跟踪表自动更新、每日对账 | 飞书 hire/document_ai/im/base API |
+| [**schedule-interview**](skills/schedule-interview) | 面试时间协调：批量查面试官空闲，和候选人给定时间求交集，产出可约时段 + 可转发给面试官的确认草稿 | Python，配合飞书 calendar/contact API |
 | [**neat-freak**](skills/neat-freak) | 会话收尾时对项目文档和 Agent 记忆做"洁癖级"审查与同步，跨平台（Claude Code / Codex / OpenCode / OpenClaw） | 纯文档，无依赖 |
 | [**storage-analyzer**](skills/storage-analyzer) | 只读扫描磁盘占用，生成交互式 HTML 报告，支持网页上一键清理（移废纸篓/直接删），macOS + Windows | Python 3 标准库，零第三方依赖 |
 
@@ -63,23 +65,32 @@ agent-skills/
 ├── CONTRIBUTING.md           ← 贡献指南
 ├── .gitignore
 └── skills/
-    ├── collect-resumes/
-    │   ├── SKILL.md          ← Agent 入口：流程 + 检查点
-    │   ├── README.md         ← 人类维护文档
-    │   ├── .env.example      ← 配置模板
-    │   ├── references/       ← 按需加载的参考文档
-    │   └── scripts/          ← Node.js 辅助脚本
-    ├── recruit-followup/
+    ├── collect-resumes/      ← 收简历+归档（Node.js + 飞书 mail）
     │   ├── SKILL.md
-    │   └── .env.example
-    ├── neat-freak/
+    │   ├── README.md
+    │   ├── .env.example
+    │   ├── references/
+    │   └── scripts/
+    ├── analyze-resumes/      ← AI 简历评估（Python + 飞书 document_ai）
+    │   ├── SKILL.md
+    │   ├── .env.example
+    │   ├── references/
+    │   └── scripts/
+    ├── recruit-followup/     ← 候选人跟进全流程（飞书 hire/im/base）
+    │   ├── SKILL.md
+    │   ├── .env.example
+    │   └── scripts/
+    ├── schedule-interview/   ← 面试时间协调（Python + 飞书 calendar/contact）
+    │   ├── SKILL.md
+    │   └── scripts/
+    ├── neat-freak/           ← 文档/记忆洁癖审查（纯文档）
     │   ├── SKILL.md
     │   └── references/
-    └── storage-analyzer/
+    └── storage-analyzer/     ← 磁盘占用分析（Python 标准库）
         ├── SKILL.md
         ├── references/
-        ├── scripts/          ← Python 标准库脚本
-        └── assets/           ← HTML 报告模板
+        ├── scripts/
+        └── assets/
 ```
 
 ## Skill 规范
