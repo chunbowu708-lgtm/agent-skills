@@ -8,10 +8,15 @@
 
 | Skill | 用途 | 语言/依赖 |
 |-------|------|-----------|
+| [**jd-craft**](skills/jd-craft) | JD 质量体检 + 需求澄清问题 + 专业版 JD + BOSS 个性化问候语生成 | 纯文档（prompt 驱动），配合 pandoc |
 | [**collect-resumes**](skills/collect-resumes) | 从邮箱扫描简历邮件，按岗位归档到本地文件夹（附件下载 + 链接类附件抓取 + 多邮件合并 + 薪酬脱敏） | Node.js，配合飞书 mail API |
 | [**analyze-resumes**](skills/analyze-resumes) | 对归档简历做 AI 5维评估，产出强推/可推/待定/不推四档判定 + 业务推荐摘要 | Python + AI，配合飞书 document_ai |
 | [**recruit-followup**](skills/recruit-followup) | 招聘跟进全流程：候选人录入飞书招聘、邀约信号扫描、面评同步、跟踪表自动更新、每日对账 | 飞书 hire/document_ai/im/base API |
 | [**schedule-interview**](skills/schedule-interview) | 面试时间协调：批量查面试官空闲，和候选人给定时间求交集，产出可约时段 + 可转发给面试官的确认草稿 | Python，配合飞书 calendar/contact API |
+| [**interview-guide**](skills/interview-guide) | 面试考核维度问答：照公司5张评分表出4轮考察重点+定制问题（行为+情境+简历薄弱点追问） | 纯文档（prompt 驱动） |
+| [**candidate-nurture**](skills/candidate-nurture) | 候选人保温+面评催收：读对账预警→产出"今天该碰谁+话术"行动清单 | 纯文档，依赖 _daily_report.json |
+| [**talent-profile**](skills/talent-profile) | 候选人匹配覆盖图：JD要求×候选人矩阵，✅/⚠️/❌覆盖度（不打分），横向对比谁缺哪块 | Python，输出 HTML |
+| [**pipeline-dashboard**](skills/pipeline-dashboard) | 招聘管道看板：岗位×阶段漏斗+停滞预警+转化率，HTML可视化 | Python，输出 HTML |
 | [**neat-freak**](skills/neat-freak) | 会话收尾时对项目文档和 Agent 记忆做"洁癖级"审查与同步，跨平台（Claude Code / Codex / OpenCode / OpenClaw） | 纯文档，无依赖 |
 | [**storage-analyzer**](skills/storage-analyzer) | 只读扫描磁盘占用，生成交互式 HTML 报告，支持网页上一键清理（移废纸篓/直接删），macOS + Windows | Python 3 标准库，零第三方依赖 |
 

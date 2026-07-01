@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>招聘管道看板</title>
+<style>
+  body { font-family: -apple-system, "Microsoft YaHei", sans-serif; margin: 20px; background: #f8f9fa; color: #1a1a1a; }
+  h1 { font-size: 22px; }
+  h2 { font-size: 17px; margin-top: 28px; border-bottom: 2px solid #ddd; padding-bottom: 6px; }
+  .meta { color: #666; font-size: 13px; margin-bottom: 16px; }
+  .funnel { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin: 16px 0; }
+  .funnel-stage { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 10px 16px; text-align: center; min-width: 80px; }
+  .funnel-stage .count { font-size: 22px; font-weight: 700; }
+  .funnel-stage .label { font-size: 12px; color: #666; }
+  .funnel-stage.bottleneck { border-color: #e74c3c; background: #fdf0ef; }
+  .funnel-arrow { color: #bbb; font-size: 18px; }
+  .funnel-rate { font-size: 11px; color: #999; }
+  table { border-collapse: collapse; width: 100%; background: #fff; font-size: 13px; margin: 12px 0; }
+  th, td { border: 1px solid #e0e0e0; padding: 6px 8px; text-align: center; }
+  th { background: #f0f0f0; font-weight: 600; }
+  td.pos { text-align: left; font-weight: 500; white-space: nowrap; }
+  .stuck-0 { color: #27ae60; }
+  .stuck-warn { color: #f39c12; font-weight: 600; }
+  .stuck-crit { color: #e74c3c; font-weight: 700; }
+  .warn-wall { background: #fff; border-radius: 6px; padding: 12px 16px; margin: 8px 0; }
+  .warn-item { padding: 4px 0; font-size: 14px; }
+  .warn-crit { border-left: 4px solid #e74c3c; padding-left: 8px; margin-bottom: 4px; }
+  .warn-warn { border-left: 4px solid #f39c12; padding-left: 8px; margin-bottom: 4px; }
+  details { margin: 4px 0; }
+  summary { cursor: pointer; font-size: 13px; color: #0066cc; }
+</style>
+</head>
+<body>
+<h1>招聘管道看板</h1>
+<div class="meta">生成时间 {{DATE}} · 数据源 {{SOURCE}}</div>
+
+<!-- 视图1：全局漏斗 -->
+<h2>全局漏斗</h2>
+<div class="funnel">{{FUNNEL}}</div>
+
+<!-- 视图2：分岗位矩阵 -->
+<h2>分岗位明细</h2>
+<table>
+  <tr>{{MATRIX_HEADERS}}</tr>
+  {{MATRIX_ROWS}}
+</table>
+
+<!-- 视图3：停滞预警墙 -->
+<h2>停滞预警</h2>
+<div class="warn-wall">
+  {{WARN_WALL}}
+</div>
+
+</body>
+</html>

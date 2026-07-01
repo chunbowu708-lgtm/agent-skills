@@ -108,6 +108,7 @@ def upsert_row(person, time_map, dry_run):
     # 基础字段
     fields = {
         "候选人": name,
+        "talent_id": person.get("talent_id", ""),  # talent_id 列（对账用，治漏报根因）
         "岗位": safe_option(job_pos, _field_opts("岗位"), "岗位"),
         "部门": safe_option(dept, _field_opts("部门"), "部门"),
         "职能类别": safe_option(func, OPT_FUNC, "职能类别"),
