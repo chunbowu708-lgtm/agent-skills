@@ -1,239 +1,302 @@
 ---
 name: recruit-followup
 description: >
-  候选人跟进：从业务邀约信号到飞书招聘录入、面试流转、面评同步、跟踪表更新。
-  触发词：跟进候选人、录入候选人、录到岗位、安排面试、扫群、招聘日报、今日待办、面评、催面评、推进流程。
-  只要用户提到候选人面试、邀约、飞书招聘录入、招聘跟踪表、招聘群扫描，就使用这个skill。
-  覆盖：飞书招聘候选人录入（Document AI 解析+附件+建talent+建投递）、招聘群邀约信号扫描、面评卡片读取、跟踪表自动建行与状态更新、今日待办文档产出。
-  不覆盖：简历收集归档（见 collect-resumes skill）、招聘平台打招呼、发面试链接（人工关键操作，不自动化）。
-  依赖：lark-cli（hire/document_ai/im/base/docs 域，bot 身份已授权，权限已全，不查 auth）、岗位缓存 JSON（{job_id:{code,title,dept}}）。
+  候选人跟进全流程：每日对账（ATS 中轴）→ LLM判读消息意图并落盘 _signals.json → 录入飞书招聘 → 面试流转 → 面评同步 → 跟踪表更新 → 日报。
+  触发词：跟进候选人、录入候选人、安排面试、扫群、招聘日报、今日待办、面评、催面评、推进流程、对账。
+  只要用户提到候选人面试、邀约、飞书招聘录入、招聘跟踪表、招聘群扫描，就使用这个 skill。
+  不覆盖：简历收集归档（collect-resumes）、BOSS 打招呼（boss-recruit）、发面试链接（人工关键操作）、
+  保温话术匹配和触达记录（见 candidate-nurture，本skill只产出信号数据供其消费）。
 ---
 
 # 候选人跟进
 
+## 最高原则
+
+1. **ATS 是唯一事实源，不是跟踪表。** 飞书招聘（applications + interviews + stage_time_list）是实时事实；跟踪表是人工维护的、会漂移的。一切对账以 ATS 为中轴。
+
+2. **该脚本的地方脚本，该 AI 的地方用 AI。** 确定性计算（谁卡几天、谁该推进、面评状态）交给脚本；意图判读（这条消息是邀约还是拒绝）交给 LLM。两者职责不混淆。
+
+3. **一条命令全包。** 用户跑 `python notes/_daily_review.py`，Agent 读结果 + 判读消息，直接产出最终作战清单。用户只看清单 + 确认异常。
+
+4. **不猜，按优先级查实。** 凡是接口路径、字段名、token 用法、返回结构、命令语法——先看现成的再造轮子，严格按下面顺序，不许跳级试探：
+   - **① 有脚本/skill 的看脚本**：`_hire.py`/`_lark_shared.py`/`_daily_review.py` 已封装好鉴权、路径、字段映射，import 其函数复用。skill 文档（本文件 + `CLAUDE.md` + `notes/hire_record.md`）也写了铁律和易错点。
+   - **② 脚本没有的查官方文档**：[招聘开发指南](https://open.feishu.cn/document/server-docs/hire-v1/recruitment-development-guide)，URL 末尾加 `.md` 拉 markdown。
+   - **③ 都没有再最小化实测**：用最小请求二分定位，这是最后手段。
+   - ❌ **禁止试探式盲调**：不知道接口就试一个看 404 再换、不知道 token 就乱包一层——这是最大的浪费时间来源。
+
+5. **不漏不错 > 速度 > 功能丰富。**
+
+6. **不通过先问再终止。** 发现不通过面评（conclusion=2）→ 报告用户 → 用户确认后才调 terminate 接口。用户没确认不擅自动 ATS。
+
+> 规则背后的 why 见 [`references/decisions.md`](references/decisions.md)（维护者参考，日常执行不看）。
+
+---
+
 ## 配置
 
-所有凭证/路径走环境变量，见 [`.env.example`](.env.example)。下文用 `$LARK_APP_ID` / `$LARK_APP_SECRET` / `$TRACKING_BASE_TOKEN` 等指代。
-
-| 项 | 来源 |
+| 项 | 值 |
 |---|---|
-| 项目根 | `$PROJECT_ROOT` |
-| 飞书招聘应用 | `$LARK_APP_ID` / `$LARK_APP_SECRET`（开放平台获取） |
-| 岗位缓存 | `$PROJECT_ROOT/notes/jobs_map.json`（{job_id:{code,title,dept}}） |
-| 跟踪表 | Bitable base `$TRACKING_BASE_TOKEN` / 表 `$TRACKING_TABLE_ID` |
-| 候选人主库 | Bitable 同 base / 表 `$CANDIDATE_TABLE_ID` |
-| 简历下载默认落点 | `$DOWNLOAD_DIR`（留空则 `~/Downloads`） |
-| lark-cli | `$LARK_CLI_PATH`（留空则假定在 PATH），hire/document_ai 域用 bot 身份 |
-| 录入速查 | `$PROJECT_ROOT/notes/hire_record.md`（命令模板，完整版） |
+| 项目根 | `F:/miniwanob` |
+| lark-cli | `C:/Users/wuchunbo/AppData/Roaming/npm/lark-cli.cmd`（subprocess 必须全路径） |
+| 飞书招聘应用 | `cli_aa84d938c8259bd6`（hire/document_ai 域用 bot 身份） |
+| 跟踪表 | Bitable `KRAQbxQR0aj2ymsuZRvcwHLdnKQ` / 表 `tblFZcRms15NlGkr` |
+| 候选人主库 | 同 base / 表 `tbl31hGzsIJrzTWN` |
+| 招聘岗位表 | 同 base / 表 `tbl0f9ynYsdQhYDo`（field 映射缓存 `notes/_job_table_map.json`） |
+| JD库表 | 同 base / 表 `tbl1AW11ezEQsADH`（人工维护展示层，暂不自动同步） |
+| **对账脚本** | `notes/_daily_review.py`（ATS 中轴，6 路并行） |
+| **表格同步脚本** | `notes/_sync_tables.py`（复用对账引擎，同步跟踪表客观层+岗位表，定时调度） |
+| **对账共享库** | `notes/_lark_shared.py`（收口 api/cli/extract_json/时间转换，所有脚本统一 import） |
+| **录入脚本** | `notes/_hire.py`（一键全量录入，含去重+批量） |
+| **建跟踪表** | `<skill>/scripts/track_after_hire.py`（录入后建行，吃 `_hire_result.json`，幂等） |
+| **录入闸门** | `<skill>/scripts/verify_hire.py`（read-only 三重对账，录入后必跑） |
+| **换最新简历** | `<skill>/scripts/swap_resume.py`（存量 talent 投递绑旧版时，terminate+重建让投递用最新附件） |
+| **晚审脚本** | `notes/_evening_review.py`（扫面评 conclusion、催未提交、不通过先问再终止） |
+| **定时同步** | Windows 计划任务 `MiniwaRecruitDailySync`（每天 18:30 跑 `_sync_tables.py`，日志 `notes/_sync_log.txt`） |
+| 岗位缓存 | `notes/jobs_map.json`（可能过期，以 API 实查为准） |
+| 简历落点 | `F:/Users/wuchunbo/Downloads`（先查这里），兜底 `data/在招岗位候选人管理/`（`find data -iname "*姓名*"`） |
+
+`<skill>` = `C:/Users/wuchunbo/.agents/skills/recruit-followup`
 
 ---
 
-## 任务1：录入候选人到飞书招聘（核心，已全自动）
+## 执行顺序
 
-**输入**：候选人简历 PDF + 岗位编号（如 A105045）
-**目标**：API 录入 = HR 后台手动上传简历的完全等价效果（PDF 进去，解析内容 + 可下载简历都在）
+### 每日早晨（最高优先级）
 
-### 核心认知（最重要）
+> **背景**：每晚 18:30 计划任务 `MiniwaRecruitDailySync` 已自动跑 `_sync_tables.py`，把 ATS 数据同步到跟踪表（客观层）+ 岗位表（招聘进展/offer/入职人数）。早晨 Agent 读到的表格已是最新状态——但仍需重跑对账拿最新消息做意图判读（18:30 后的消息、今天面试结果）。
 
-**两种录入路径，优先 B（更稳更省），A 是兜底：**
-
-**路径 B（推荐，待验证）**：传附件 → combined_create 只填 basic_info（name + mobile + email，用于去重和联系）→ 让飞书招聘**自己解析附件**填 career/education。
-- **假设**：combined_create 带 attachment 会触发飞书招聘原生简历解析（和 HR 后台手动上传同源）
-- **验证方法**：挑一个新候选人，只传附件 + minimal basic_info，**不传 career_list/education_list**。建完立即查 talent.career_list，再过 5 分钟、30 分钟各查一次，确认是否自动补全 + 时间差
-- 验证通过 → 彻底改用 B，删除路径 A 的手动映射；验证失败 → 保留 A 为标准
-
-**路径 A（当前默认，兜底）**：Document AI 解析 PDF → 手动映射字段 → combined_create 全量写入。
-- Document AI 和飞书招聘原生解析同源（都飞书出品），但手动映射有损耗且坑多（gender/degree 枚举、时间戳、字段名 field_of_study）
-
-### 5 步流程（路径 A：手动映射；验证 B 成功后②④可大幅简化）
-
-> **路径 B（验证后）只需：③传附件 → ④combined_create（只 basic_info + attachment_id）→ ⑤建投递**。Document AI（②）和手动映射（④的大部分）可跳过。
-
-#### ① 查 job_id（先查本地缓存，O(1)）
-```bash
-# 本地缓存查
-python -c "import json;d=json.load(open('notes/jobs_map.json',encoding='utf-8'));[print(k,v['title'],v['dept']) for k,v in d.items() if v['code']=='A105045' or '关键字' in v['title']]"
-# 缓存过期（岗位增删）才刷新：
-MSYS_NO_PATHCONV=1 lark-cli api GET /open-apis/hire/v1/jobs --as bot --params "{\"page_size\":20}" --page-all
+```
+第1步  跑对账脚本        python notes/_daily_review.py
+         （表格客观层昨晚已同步，本步重算今日作战数据 + 拉最新消息）
+第2步  Agent 读 _daily_review.json
+         ├─ 读 structured（脚本算好的确定性结果）
+         └─ 读 raw_messages（群+私聊+bot 全量原文，7天）
+第3步  Agent 用 LLM 判读 raw_messages 意图（邀约/拒绝/决策/讨论）
+第3.5步 Agent 写 _signals.json（判读结果落盘，格式见 candidate-nurture/references/signals-contract.md）
+第4步  Agent 合并 structured + 判读结果 → 产出作战清单（红黄绿分级）
+第4.5步 用户审查作战清单后，Agent 更新 _signals.json 的 decisions（记录用户决策）
+第5步  输出给用户（见「输出前自检」）
+第6步  接棒 candidate-nurture 出保温清单（见下方「接棒保温」）
 ```
 
-#### ② Document AI 解析 PDF（路径 A 必需；路径 B 可跳过，让飞书招聘原生解析）
-```bash
-MSYS_NO_PATHCONV=1 lark-cli api POST /open-apis/document_ai/v1/resume/parse --as bot --file "file=<简历相对路径>" > notes/_parse.json
-```
-返回：name/mobile/email/birthday/gender/careers/educations/projects/self_evaluation
+> **接棒保温（step 6，不可省）**：作战清单输出后，Agent **必须主动继续执行 candidate-nurture**——读 `_signals.json`（刚写的）+ `_daily_review.json` 的 stuck/feedback_overdue/to_advance + `_nurture_state.json`（触达历史），产出"今天该碰谁+话术+升级标注"的保温清单。
+>
+> **为什么必须接棒**：保温清单和作战清单是**同一个早晨决策流的两半**——作战清单管"今天处理谁"（邀约/录入/推进），保温清单管"今天碰谁"（候选人保温/催面评）。不接棒 = 信号文件白写、保温状态空转、候选人静默流失。这是之前最大的断点：recruit-followup 写完 `_signals.json` 就停了，nurture 在等一个永远不会来的触发。
+>
+> **接棒方式**：Agent 直接按 candidate-nurture 的 SKILL.md 工作流执行（不需用户重新喊"保温"）——读三路数据 → 排优先级 → 匹配话术 → 产出保温清单给用户确认。用户确认执行后，调 `nurture_state.py --touch` 记录触达，闭合保温环。
 
-#### ③ 上传简历附件（挂简历，可下载）
-```bash
-MSYS_NO_PATHCONV=1 lark-cli api POST /open-apis/hire/v1/attachments --as bot --file "content=<简历相对路径>"
-```
-→ attachment_id。⚠️ 字段名是 **content**。
+**用户看到的是分级作战清单**，不是数据大表。Agent 负责把"今天注意力放哪"讲清楚。
 
-**lark-cli 局限（通用认知）**：`--file "k=v"` 只认文件路径，**传不了纯字符串字段值**（v 不是文件就报 cannot open file）。所以 multipart 表单只要含字符串字段（如 file_name），lark-cli 就做不到，要用 Python requests。
+> ⚠️ **作战清单不是终点——step 6 必须接棒保温**。作战清单管"今天处理谁"，保温清单管"今天碰谁"。两个清单在同一次早晨对账里**连续产出**，不是分开的两次任务。Agent 输出作战清单、用户确认决策后，**立即继续**按 candidate-nurture 出保温清单。
 
-**带文件名上传（Python requests，每次都用这个）**——飞书 `/attachments` 支持 `file_name` + `file_type`，带上才不会变 `unknown-file`。**凭证从环境变量读，不要硬编码**：
-```python
-import os, requests
-APP_ID     = os.environ['LARK_APP_ID']      # 从 .env / 环境变量，绝不硬编码
-APP_SECRET = os.environ['LARK_APP_SECRET']
-t = requests.post('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal',
-                  json={'app_id': APP_ID, 'app_secret': APP_SECRET}).json()['tenant_access_token']
-H = {'Authorization': f'Bearer {t}'}
-with open('<简历绝对路径>', 'rb') as f:
-    files = {'content': ('<文件名.pdf>', f, 'application/pdf')}
-    data  = {'file_name': '<文件名.pdf>', 'file_type': 'pdf'}
-    att_id = requests.post('https://open.feishu.cn/open-apis/hire/v1/attachments',
-                           headers=H, files=files, data=data).json()['data']['id']
-```
-⚠️ **第一次就要传对文件名**——飞书招聘**没有删除 talent 附件的 API**，传错的 unknown-file 删不掉。
+#### 表格自动同步（每晚 18:30，无人值守）
 
-#### ④ 建/更新 talent + 写回解析结果
-**先解析确认给用户看，再写**（用户已确认此行为）：
-- 把②解析出的姓名/手机/工作经历/要投岗位列出来给用户
-- 用户说"录入"才执行
-- talent 不存在 → combined_create
-- talent 已存在（去重命中旧档）→ combined_update 补字段
+计划任务 `MiniwaRecruitDailySync` 每晚 18:30 跑 `notes/_sync_tables.py`：
+- **跟踪表**：复用 `_daily_review.write_back`，客观层从 ATS 全量同步（状态/轮次/面试时间/进入阶段日期），主观层只填空槽（不覆盖人工值）
+- **岗位表**：从 ATS 按岗位聚合，更新「目前招聘进展/已发Offer人数/已入职人数」
+- **不做意图判读**：那是 LLM 的活，定时任务只做确定性同步，`_signals.json` 仍由早晨 Agent 会话产出
+- 日志：`notes/_sync_log.txt`；报告：`notes/_sync_result.json`
+- 手动触发：`schtasks /run /tn MiniwaRecruitDailySync`
+- 注册/卸载：`powershell -ExecutionPolicy Bypass -File notes/setup_daily_sync.ps1`
 
-**路径 B（验证后用这个，最简）**：combined_create 只填 basic_info（name + mobile + email）+ resume_attachment_id，**不传 career_list/education_list**，让飞书招聘自己解析附件补全。建完 5 分钟后查 talent.career_list 确认补全。
+#### 对账脚本做什么（理解用，不用手做）
 
-**路径 A（当前默认，手动全量映射）**：请求体用 Python 脚本生成（写文件避免 cmd 转义中文；脚本顺便做枚举映射/时间戳转换）：
-```bash
-MSYS_NO_PATHCONV=1 lark-cli api POST /open-apis/hire/v1/talents/combined_create --as bot --data "@notes/_talent.json"
-# combined_update 路径：POST /open-apis/hire/v1/talents/combined_update，body 带 talent_id + basic_info
-```
-⚠️ **combined_update 即使只改一个字段（如换附件），也必须带 `basic_info`**（报 `basic_info is required`，沿用原值即可）。
+**6 路并行拉取**（独立数据源必须并行）：
+1. **ATS applications（全量分页，中轴）**：所有活跃投递，含 `stage_time_list`
+2. **ATS interviews**：对面试阶段(type=4)的查面试详情，算面评状态
+3. **跟踪表**：含 talent_id 列
+4. **飞书日程**：从 description 提 application_id（不靠 summary 子串）
+5. **群消息（自动发现 + 7 天）**：原文全量导出，不做关键词分类
+6. **私聊 + 飞书招聘 bot**：Bruce 私聊 + 系统通知，原文全量导出
 
-枚举/时间戳转换（脚本里做）：
-- `birthday`/`start_time`/`end_time`："2022-11-01" → 毫秒时间戳字符串 `"1667260800000"`；空或"至今" → 不传该字段
-- `gender`：AI 返回 0 → 不传（只认 1男/2女/3其他）
-- `degree`："本科" → int 6（5大专/6本科/7硕士/8博士）
-- `field_of_study`：专业字段名是这个，不是 major
-- `mobile`：要同时带 `mobile_code:"86"` + `mobile_country_code:"CN_1"`；空（如隐私保护）→ 不传，单留 email
+**确定性计算**（脚本直接算）：
 
-#### ⑤ 建投递
-```bash
-MSYS_NO_PATHCONV=1 lark-cli api POST /open-apis/hire/v1/applications --as bot --data "@notes/_app.json"
-```
-
-### Document AI → Hire API 字段映射（关键易错点）
-
-| Document AI 返回 | Hire API 写入 | 注意 |
+| 计算 | 公式 | 业务问题 |
 |---|---|---|
-| mobile | basic_info.mobile | 配 mobile_code:"86" + mobile_country_code:"CN_1" |
-| email | basic_info.email | |
-| date_of_birth "1994-11-02" | basic_info.birthday | **转毫秒时间戳字符串** |
-| gender | basic_info.gender | ⚠️ **AI 返回 0 不能直接塞**，hire 只认 1男/2女/3其他，未知就不传 |
-| careers[].company/title/job_description | career_list[].company/title/desc | |
-| careers[].start_date "2022-11-01" | career_list[].start_time | **转毫秒时间戳字符串** |
-| careers[].type | career_list[].career_type | 1实习/2全职 |
-| educations[].school | education_list[].school | |
-| educations[].degree "本科" | education_list[].degree | ⚠️ **转 int**：5大专/6本科/7硕士/8博士 |
-| educations[].major | education_list[].field_of_study | ⚠️ 字段名是 field_of_study，不是 major |
+| 卡住 | `now - stage_time_list无exit_time.enter_time > 2天` | "哪些面试流程卡了" |
+| 待推进 | `interview_record_list 有 conclusion==1 且 stage=面试` | "哪些人该进下一步" |
+| 催面评 | `面试 end_time 已过 且无 feedback_submit_time` | "哪些面试官该催" |
+| 表落后ATS | talent_id 精确比对 | "表哪里漂移了" |
+
+**消息意图判读**（这是"该 AI 的地方"，Agent 读 JSON 做）：
+- 脚本导出 `raw_messages`（不截断，7 天）+ `structured.hire_bot_events`（系统卡片已结构化）
+- Agent 用 LLM 逐条判读：邀约指令/拒绝信号/决策结论/讨论噪声
+- **不用关键词**（"安排不太合适"含"安排"但是反对；"需要hr帮忙面一轮"无邀约词但是真邀约）
+
+**信息源（自动发现，不硬编码）**：
+- **群**：脚本调 `discover_recruit_chats()` 自动发现招聘相关群，排除 external=true 的外部社群（HR 社区等噪声）
+- **私聊 + 系统通知**：钟波(Bruce) 私聊 `oc_37218905e0782cfd5f239b5106162fe0`（决策指令最密集）、飞书招聘通知 `oc_eceb45fc66a90be574089b72ffca7565`（面试反馈/接受/未到场卡片）
+
+**输出 `notes/_daily_review.json`**：数据契约见 [`references/review-contract.md`](references/review-contract.md)（字段名、消费者约定的单一真相源）。改 `_daily_review.py` 输出结构必须同步改契约。
+
+#### 信号判读规则（该 AI 的地方）
+
+**信号边界（只跟这两类，其余噪声）**：
+- **A 类**：业务方主动邀约（"约下/聊聊/安排面试/推进下一步"）
+- **B 类**：Bruce/钟波 @吴春波 + 明确动词
+- ❌ Bruce 只发简历没 @我 → 不跟
+
+**判读规则**（对抗审查证实的坑，必须遵守）：
+1. **拆句判读**：一条消息可能含多个意图（"第一位可邀约，第二位不适合，第三位不推进" = 1邀约+2拒绝）
+2. **不用关键词**："安排不太合适"含"安排"但是反对；"没有时间帮忙面试"含"面试"但是推迟
+3. **拒绝话术**：业务用"不推进/不适合/做备选/不太合适/hold一下/先放放"，全不在关键词表里，但都是拒绝
+4. **隐藏邀约**："需要hr帮忙面一轮"无邀约词，但是真邀约
+5. **系统卡片**：飞书招聘通知的卡片已在 `structured.hire_bot_events` 结构化，直接用，不重新判读
+
+**判读结果落盘（step 3.5）**：判读完成后必须写入 `notes/_signals.json`（不是口头呈现在作战清单里就完了）。这是 candidate-nurture 交叉比对的数据源——不落盘 nurture 读不到意图。写入格式见 [`candidate-nurture/references/signals-contract.md`](../../candidate-nurture/references/signals-contract.md)。
+
+**用户决策落盘（step 4.5）**：用户审查后，Agent 按决策更新 `_signals.json` 的 `decisions` 部分。candidate-nurture 读 decisions 过滤——用户已决定"今天约"的不重复提醒，决定"终止"的不再保温。不落盘 = nurture 和早晨作战清单两张皮。
 
 ---
 
-## 任务2：早晚扫描（识别邀约信号 + 状态校准）
+### 录入候选人（业务邀约后）
 
-### 信号边界（铁律）
+**统一入口（日常用这个）**——`--by-name` 自动按优先级查找简历：
 
-只跟进两类信号：
-- **A 类**：业务群里我发的简历，业务明确表态"约下/聊聊/安排面试"
-- **B 类**：招聘负责人 @我 + 明确邀约指令
-- ❌ **负责人只发简历没 @我 → 不跟进**
-
-### 早上 9:20 审查
-```
-1. 扫招聘群近 24h 消息（chat-messages-list --order desc）
-   → 抓"@我 + 动词(约/安排/聊聊/面试) + 候选人"
-   → 排除负责人未 @我 的纯发简历
-2. 扫飞书招聘 applications（bot）→ 对比跟踪表，找阶段变化、新面评
-3. 飞书招聘面评卡片（user 身份 messages-search "面试有新反馈"）
-4. 三向对账：群信号 × 跟踪表 × 飞书招聘投递 → 找差异
-5. 输出「今日待办」文档（红黄绿分级）
-```
-
-### 招聘沟通群
-
-群 chat_id 从环境变量 `$RECRUIT_CHAT_IDS`（逗号分隔）读取。在飞书群设置里拿到 chat_id 后填入 `.env`。
-
-### 自动建跟踪表行（用户已确认此行为）
-
-扫到 A/B 类信号就**自动建行**，状态"待约面"，**不再每次问用户**。用户只否决异常的。
 ```bash
-chcp 65001 >nul && lark-cli base +record-upsert \
-  --base-token "$TRACKING_BASE_TOKEN" \
-  --table-id "$TRACKING_TABLE_ID" \
-  --json "{\"字段\":\"值\"}"
+第1步  python notes/_hire.py --by-name 白向庭,李毅 --job 海外游戏数据产品经理
+第2步  python scripts/track_after_hire.py          # 建跟踪表行+写 talent_id
+第3步  python scripts/verify_hire.py               # 闸门：必跑，不过则 STOP
+第4步  (可选) verify_hire 告警"旧简历待清理"时 → python scripts/swap_resume.py --talent <id> --pdf <最新简历>
+       # 存量 talent 投递绑了旧版，terminate+重建让它用最新附件（仅早期阶段投递，见下方铁律）
 ```
 
-### 状态更新规则
-- **通过/不通过**：一律以**飞书招聘面试官面评**为准，不看口头/群里转述
-- **催面评**：当天面试当天催，不隔夜
-- **不通过**：面评一出，跟踪表状态→终止，不拖延
-- **通过**：推进下一轮，跟踪表轮次+1
+`--by-name` 三级级联查找（每级找不到自动降级）：
+
+| 优先级 | 来源 | 匹配规则 |
+|--------|------|----------|
+| ① | 本地归档库 `data/在招岗位候选人管理/` | 文件名以「姓名_」开头（collect-resumes 归档规范）|
+| ② | Downloads `F:/Users/wuchunbo/Downloads` | 文件名含姓名即可 |
+| ③ | **飞书群聊/私聊**（自动搜+下载）| `im +messages-search` 搜姓名的文件消息，下载到 Downloads |
+
+> ③ 简历只在群里发过、本地没有时，自动从飞书群聊搜到并下载。底层调 `_download_chat_file.py`。
+
+**完整路径**（跨岗位批量，或要精确控制每份简历路径时用）：
+
+```bash
+第0步  python notes/_hire.py --jobs 关键词                  # 查 job_code
+第1步  写清单 notes/_hire_list.txt（每行：简历路径|岗位编号|姓名）
+第2步  python notes/_hire.py notes/_hire_list.txt --list   # 录人才+建投递
+第3步  python scripts/track_after_hire.py                   # 建跟踪表行+写 talent_id
+第4步  python scripts/verify_hire.py                        # 闸门：必跑，不过则 STOP
+```
+
+#### 录入铁律
+
+- **原子流程，4 步不许拆开**。建跟踪表割裂成独立手敲步骤 = AI 每次从零试错。详见 decisions.md。
+- **岗位准入闸门**：录入目标岗必须同时满足「我创建 + 开放中(active_status=1)」。`_hire.py` 内置 `job_filter_ok()` 自动校验，即使直接传 A 编号也会校验状态+归属。暂停/已关闭的岗飞书删不掉，靠准入过滤而非手工避让。
+- **job_code 自己查，别问用户**：`python notes/_hire.py --jobs 关键词` 一条命令搞定；`--by-name` 的 `--job` 直接传岗位关键词（脚本自动解析成 code 并校验）。`jobs_map.json` 会过期，别依赖它。同名岗位才需用户确认。**绝不手撸 jobs API。**
+- **`verify_hire` 不过（🔴 STOP）不许继续**——talent 误关联/投递缺失/投错岗位都是真问题。
+- **Document AI 解析 → combined_create 一次写全**，不要先 create 再 update，不要传附件指望自动解析（实测不解析）。
+- **talent_id 是对账主键**：`track_after_hire.py` 录入时自动写入 talent_id 列，对账用它精确匹配（不用姓名，治同名错配）。
+- **重复录入安全**：同一候选人重录时，`create_application` 返回 `1002206 same application exist`，脚本识别为"跳过"（⏭️）不当错。
+- **新岗位首次录入**：跟踪表"岗位"下拉可能没这个选项 → 先用 `base +field-update`（PUT 全量语义，必带原有所有选项+新增项）补选项，再在 `track_after_hire.py` 的 JOB_MAP 加映射。两步别只做一步。
+- **存量 talent 旧简历风险（关键坑，2026-07-23 实测修正）**：录入时复用存量 talent，本次上传的新附件会挂到档案，但**投递的 `talent_attachment_resume_id` 绑的是旧附件**（面试官首屏看到旧简历）。`_hire.py` 会告警 `⚠️ 旧简历待清理`。
+  - **飞书没有「换投递主简历」API**：投递只读字段 + 无 update/patch 接口（update/patch/partial_update 路径全 404）。
+  - **解法 = terminate 旧投递 + 重建**：用同一 talent 在同岗位建投递，飞书自动绑定档案里**最新上传**的附件。旧附件保留在档案（删不掉，但不影响默认展示）。一条命令：`python scripts/swap_resume.py --talent <id> --pdf <最新简历>`（脚本固化了流程 + 3 个坑：路径自动定位 / att_id 以回读档案为准 / list 延迟重试）。
+  - **⚠️ 仅限早期阶段投递**：terminate 会重置阶段状态。已到面试/Offer 阶段的投递不能用此法（会丢面评/审批），那种只能让用户去飞书后台手动换简历。
+  - **判断「主简历是否最新」**：以 `combined_update` 后**回读档案**拿到的附件 id 为准（第一个是最新），不能用 `upload_attachment_with_name` 的返回值——combined_update 后档案里挂的 id 会重新生成，和上传返回值不同。
+
+#### 字段映射 / 踩坑清单
+
+Document AI → Hire API 的字段映射、易错点、手动排错命令模板见 [`notes/hire_record.md`](../../../../../miniwanob/notes/hire_record.md)（手动排错时才查；日常录入走 `_hire.py` 脚本不需要看）。
 
 ---
 
-## 任务3：邀约的 4 步拆解（AI 只做①）
+### 晚上审查（面评跟进）
 
-业务说"约下"后，不是一步，是 4 步：
+```bash
+python notes/_evening_review.py   # 扫今天面试 conclusion → 催面评/问是否终止/推进
 ```
-① 飞书招聘录入候选人    ← ★本 skill 全自动（任务1）
-② 跟候选人敲时间        ← 人工
-③ 跟面试官确认          ← 人工
-④ 发面试链接            ← 人工（关键操作，不外包）
+
+---
+
+## 面评与终止
+
+| 能力 | 接口 | 关键字段 |
+|---|---|---|
+| 读面评**结论** | `GET /hire/v1/interviews?application_id=X` | `interview_record_list[].conclusion`（1通过/2不通过/空=未提交） |
+| 读面评**全文** | `GET /hire/v1/interview_records/attachments?application_id=X&interview_record_id=Y` | 返回 PDF url（30分钟有效），含逐项打分+综合评价 |
+| 推进阶段 | `POST /hire/v1/applications/:id/transfer_stage` | **请求体只有 `stage_id`**（[官方文档](https://open.feishu.cn/document/server-docs/hire-v1/candidate-management/delivery-process-management/application/transfer_stage)）。stage_id 从 `GET /hire/v1/job_processes` 取 |
+| **终止/淘汰** | `POST /hire/v1/applications/:id/terminate` | **唯一正确接口**（`PUT /applications/:id` 不存在会 404）。请求体 `{"termination_type":<int>}`，调后 active_status=2 |
+
+**淘汰要点**：
+- terminate 是唯一正确接口；为什么不是 transfer_stage / PUT applications 见 decisions.md。
+- 调后 `active_status` 变 2，对账脚本已过滤 `active_status!=1`，不再出现在作战清单。
+- **不通过先问用户**：发现 conclusion=2 但仍 active=1 → 报告用户确认 → 确认后才调 terminate。
+- **改投递到新岗**（录错岗需转移）：在新岗建投递 + terminate 旧投递，talent 复用不重建。
+
+### 岗位范围过滤（只关注我负责的）
+
+对账脚本只关注我负责的岗位（`create_user_id=我`）。判断依据 `notes/_my_jobs.json`（我创建的岗位 job_id 快照）。
+- ⚠️ **快照会过期**：新创建的岗位不在文件里 → 该岗投递被过滤 → 候选人漏报。岗位增减后必须刷新：`python notes/refresh_my_jobs.py`（全量翻页 `page_size≤20`，>20 返回空）。
+
+### 取面评全文命令链
+
+```bash
+# 1. 拿面试列表（取 interview_record_id）
+MSYS_NO_PATHCONV=1 lark-cli api GET /open-apis/hire/v1/interviews --as bot --params '{"application_id":"APP_ID","page_size":10}'
+# 2. 拿面评 PDF
+MSYS_NO_PATHCONV=1 lark-cli api GET /open-apis/hire/v1/interview_records/attachments --as bot --params '{"application_id":"APP_ID","interview_record_id":"REC_ID"}'
+# 3. curl 下载 PDF，fitz/PyPDF2 提取文本
 ```
+
+---
+
+## 输出前自检（Agent 出作战清单前必查）
+
+每次给用户输出作战清单前，Agent 必须自查这 7 条，全过才能输出：
+
+1. **今日面试 0 条时，确认不是漏**：查日程有没有今天的面试（脚本可能因 app_id 匹配失败漏报，或候选人岗位不在 `_my_jobs.json` 快照里被过滤掉）。日程有但 today_interviews 空 → 手动补，并检查 `_my_jobs.json` 是否需要刷新。
+2. **@我的消息每条都判读了**：raw_messages 里 `mentions_wubo=true` 的消息，逐条确认意图。不能只看含"约/安排"的。
+3. **拒绝信号没被吞**：含多个候选人的消息必须拆句，拒绝不能被同条的邀约盖过。
+4. **卡住的人按紧急度排**：近期（2-4天）和积压（5天+）分开列，积压按原因聚类不逐条。
+5. **未闭环邀约单列**：群里有邀约但 ATS/日程无落地的，这是最该追的，不能埋在待邀约里。
+6. **只关注我负责的 + 未淘汰的**：脚本已过滤（按 `_my_jobs.json` + `termination_type`）。如果出现别人的岗位或已终止的人 → 是过滤漏了，报告给用户。
+7. **用户决策已落盘**（step 4.5 校验）：用户审查完作战清单做了决策后，`_signals.json` 的 `decisions` 数组必须已更新（不能是空的 `[]`）。空的 = 用户的"今天约谁/催谁/终止谁"决策丢了，candidate-nurture 接棒时会重复提醒已决策的人。如果用户还没审查或还没做决策，先等用户确认再写 decisions，再接棒 step 6。
+
+---
+
+## 数据源拉取铁律
+
+| 数据源 | 关键铁律 |
+|---|---|
+| ATS 投递 | 详情在 `data.application`（嵌套一层，不是平铺）；全量分页到 has_more=false |
+| ATS 面试 | **必须带 application_id**，裸调报 1002002；conclusion 在 interview_record_list |
+| 消息 | 在 `data.messages`（不是 data.items）；text 消息 content 是纯文本（@吴春波 已解析成文名）；窗口 7 天 |
+| 跟踪表 | **必须用 `--field-id` 投影固定列顺序**（默认列顺序不稳定）；record_id 在 `record_id_list`（复数） |
+| 日程 | 从 description 用正则提 application_id（比 summary 子串可靠）；start 是 `{'datetime':'...'}` 要提取 |
+| 岗位列表 | **`page_size>20` 返回空**，翻页必须 ≤20；item 就是 job 本身（不是嵌套在 `item.job`） |
+
+**性能**：6 路数据相互独立，必须 `ThreadPoolExecutor` 并行（max_workers=6）。ATS 详情查完后 talent 姓名 + job 信息也要批量并行（max_workers=8）。
+
+**base 子命令参数**：调 base API 前先查 [`references/lark-cli-base-commands.md`](references/lark-cli-base-commands.md)（参数速查 + 易错对照表）。不许凭印象猜参数名，猜错就是盲试。
 
 ---
 
 ## 反模式（不要做）
 
-- **不要硬编码 App Secret** — 用 `os.environ['LARK_APP_SECRET']`，凭证进 `.env`（.gitignore 已忽略）
-- **不要凭经验猜 API 字段名/类型/可选值** — 调飞书 API 前先查官方文档。文档 markdown 路径模板 `https://open.feishu.cn/document/{slug}.md`
-- **不要自己抠 PDF 填字段** — 让 Document AI 解析（同源同质，可靠）。自己抠不一致
-- **不要手动映射 career/education（路径 B 验证后）** — 若 combined_create 带 attachment 能触发原生解析（待验证），让飞书招聘自己填更全更省。手动映射只用于"录入前要先给用户预览"的场景
-- **不要传附件就以为有简历信息** — combined_update 不解析，必须配合 Document AI
-- **不要把 gender 传 0** — hire 只认 1/2/3，AI 返回 0（未知）就不传
-- **不要只传 career_list 不带 basic_info** — basic_info 必填（combined_create 和 combined_update 都要）
-- **不要把 degree 传字符串** — 是 int（6=本科），不是 "本科"
-- **不要用 --params 传 POST body** — 用 --data，--params 是 query
-- **不要用 user token 调 hire 写接口** — 报 99991668，必须 --as bot
-- **不要拿历史候选人数据验证当前流程** — 历史完整数据是历史投递遗产，不代表新录流程
-- **不要在 stdout 输出中文** — Windows GBK 乱码，写文件再 Read
-- **不要给 lark-cli --file 传绝对/中文路径** — 报 cannot open file。**一律用 cwd 相对路径**（中文路径也走得通，前提是相对）
-- **不要给 lark-cli --file 传字符串字段值** — `--file "file_type=pdf"` 会被当文件路径。multipart 的字符串字段用 Python requests
-- **不要 jobs 列表传 page_size>20** — hire API 上限 20，超了报 field validation failed
-- **不要试图删除 talent 附件** — 飞书招聘没有这个 API（HR 后台也删不了），传错只能留着
+- **不要"表自己查自己"** — 跟踪表会漂移，必须以 ATS 为中轴交叉校验
+- **不要全量翻页 applications 死循环** — 翻到 has_more=false 或安全上限 10 页
+- **不要用关键词匹配消息意图** — 交给 LLM（详见 decisions.md）
+- **不要传附件指望自动解析** — combined_create/update 都不解析，必须 Document AI 解析后映射
+- **不要 /talents?mobile= 去重** — mobile 参数不生效（传假号也返回数据），会把 A 的投递误关联到 B 的 talent
+- **不要用 user token 调 hire 写接口** — 报 99991668，必须 `--as bot`
+- **不要给 lark-cli --file 传绝对/中文路径** — 报 cannot open file，用 cwd 相对路径
+- **不要为录入另写解析/核对脚本** — `_hire.py` 已封装全流程，现造脚本=现造 bug
+- **不要凭印象记 lark-cli 子命令** — 不确定 `+<cmd> --help` 查
+- **不要直接在 Bash 里裸跑 lark-cli api POST/GET** — git-bash MSYS2 会把 `/open-apis/...` 转成 `C:/Program Files/Git/...` → 404。`_lark_shared.cli()` 已设 `MSYS_NO_PATHCONV=1` 免疫；绕过 `cli()` 直接调时必须手动加 `MSYS_NO_PATHCONV=1` 前缀
+- **不要盲信 `_my_jobs.json` 是最新的** — 它是快照，新创建岗位不刷新进去 → 漏报候选人。详见 decisions.md
 
-## 调试方法论
-
-**field validation failed 不知道哪个字段错**：lark-cli 的报错不带 field_violations，**改用 Python requests 同样的请求**，返回里会列出具体哪个字段错（`field_violations[].field`）。
-
-**最小化二分法**：
-1. 先发最小请求（只 basic_info），确认基础格式对
-2. 逐个加字段（career_list → education_list → ...），每加一个测一次
-3. 一加就报错的那个就是元凶
-
-**响应字段不一致**：同一接口不同情境返回结构可能不同（如 combined_create 返回 `data.talent.id`，有的返回 `data.talent_id`）。解析时两个位置都取：`data.get('talent_id') or data.get('talent',{}).get('id')`。
-
-## 已验证可用的 API（权限全通 ✅）
-
-| 能力 | 接口 |
-|---|---|
-| 读 talents/jobs/applications/阶段/面评 | GET /hire/v1/{resource} |
-| 读面试 | GET /hire/v1/interviews?application_id= |
-| 读 Offer | GET /hire/v1/offers/:id |
-| 建/更新人才 | POST /hire/v1/talents/combined_create\|update |
-| 建投递 | POST /hire/v1/applications |
-| 推进阶段（约面/淘汰） | POST /hire/v1/applications/:id/transfer_stage |
-| 上传简历附件 | POST /hire/v1/attachments （字段 content + file_name + file_type；lark-cli 只能传 content 要用 Python；删除附件无 API） |
-| **Document AI 解析简历** | POST /document_ai/v1/resume/parse （字段 file） |
-| 建岗位 | POST /hire/v1/jobs/combined_create（建议手动建更省事） |
+---
 
 ## 参考文档
 
-按需加载：
-- `docs/prd/候选人跟进流程.md` — 完整流程说明（本文的操作版，需自行整理）
-- `notes/hire_record.md` — 录入命令速查 + 字段映射 + 踩坑清单（需自行整理）
-- `notes/jobs_map.json` — 岗位 job_id 缓存（需自行生成）
-- 官方文档索引：[招聘开发指南](https://open.feishu.cn/document/server-docs/hire-v1/recruitment-development-guide?lang=zh-CN)
+- [招聘开发指南（官方）](https://open.feishu.cn/document/server-docs/hire-v1/recruitment-development-guide)
+- [转移投递阶段（官方）](https://open.feishu.cn/document/server-docs/hire-v1/candidate-management/delivery-process-management/application/transfer_stage)
+- [`../lark-hire/SKILL.md`](../lark-hire/SKILL.md) — **飞书招聘 OpenAPI 契约层**（接口/字段/枚举/错误码，调 hire API 前先查这里）
+- [`references/review-contract.md`](references/review-contract.md) — 对账 JSON 数据契约（字段名、消费者约定的单一真相源）
+- [`references/lark-cli-base-commands.md`](references/lark-cli-base-commands.md) — base 子命令参数速查 + 易错对照表
+- [`references/decisions.md`](references/decisions.md) — 决策记录（为什么这样设计，维护者参考）
+- [`notes/hire_record.md`](../../../../../miniwanob/notes/hire_record.md) — 录入手动排错手册（字段映射 + 命令模板 + 踩坑清单）
+- 信号判读报告样例：`notes/_signal_report.md`

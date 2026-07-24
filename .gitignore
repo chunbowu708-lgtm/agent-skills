@@ -3,12 +3,42 @@
 *.env
 !*.env.example
 
-# 运行产物
+# 运行产物 / 缓存 / 数据（绝不入库——含真实候选人、open_id、招聘状态）
 notes/_*.json
 notes/_*.html
+notes/_*.txt
+notes/collection_manifest.json
+notes/interviewers.json
+notes/jobs_map.json
+notes/fieldlist_track.json
+notes/hire_record.md
+notes/*.json.tmp
 /tmp/
 *.pyc
 __pycache__/
+
+# 候选人评估报告 / 内部笔记（绝不入库——含候选人姓名与评估内容）
+notes/简历评估/
+notes/简历评估_*.md
+notes/_发布版_简历评估_*.md
+notes/_morning_brief_*.md
+notes/_nurture_*.md
+notes/_nurture_*.json
+notes/各人负责岗位*.md
+notes/部门岗位分层总览.md
+notes/长青美术岗_*.md
+notes/mentor反馈与待办_*.md
+
+# 内部工作目录（会议纪要、踩坑记录、审查、草稿等）
+notes/会议纪要/
+notes/技术踩坑/
+notes/对抗审查/
+notes/汇报草稿/
+notes/工作流分析/
+notes/jd/
+notes/history/
+notes/_archive/
+notes/.verified_manifest/
 
 # 报告产物
 storage-report.html

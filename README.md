@@ -10,17 +10,33 @@
 |-------|------|-----------|
 | [**jd-craft**](skills/jd-craft) | JD 质量体检 + 需求澄清问题 + 专业版 JD + BOSS 个性化问候语生成 | 纯文档（prompt 驱动），配合 pandoc |
 | [**collect-resumes**](skills/collect-resumes) | 从邮箱扫描简历邮件，按岗位归档到本地文件夹（附件下载 + 链接类附件抓取 + 多邮件合并 + 薪酬脱敏） | Node.js，配合飞书 mail API |
-| [**analyze-resumes**](skills/analyze-resumes) | 对归档简历做 AI 5维评估，产出强推/可推/待定/不推四档判定 + 业务推荐摘要 | Python + AI，配合飞书 document_ai |
-| [**recruit-followup**](skills/recruit-followup) | 招聘跟进全流程：候选人录入飞书招聘、邀约信号扫描、面评同步、跟踪表自动更新、每日对账 | 飞书 hire/document_ai/im/base API |
-| [**schedule-interview**](skills/schedule-interview) | 面试时间协调：批量查面试官空闲，和候选人给定时间求交集，产出可约时段 + 可转发给面试官的确认草稿 | Python，配合飞书 calendar/contact API |
-| [**interview-guide**](skills/interview-guide) | 面试考核维度问答：照公司5张评分表出4轮考察重点+定制问题（行为+情境+简历薄弱点追问） | 纯文档（prompt 驱动） |
-| [**candidate-nurture**](skills/candidate-nurture) | 候选人保温+面评催收：读对账预警→产出"今天该碰谁+话术"行动清单 | 纯文档，依赖 _daily_report.json |
+| [**analyze-resumes**](skills/analyze-resumes) | 对归档简历做 AI 4维度评估（方向/硬卡/含金量/风险+加分），产出强推/可推/待定/不推 + 业务推荐摘要，评估完自动发飞书文档 | Python + AI，配合飞书 document_ai |
+| [**recruit-followup**](skills/recruit-followup) | 候选人跟进全流程：录入飞书招聘、跟踪表、面试流转、面评同步、每日对账、日报 | 飞书 hire/document_ai/im/base API |
+| [**schedule-interview**](skills/schedule-interview) | 面试时间协调：面试官空闲 ∩ 候选人时间，产出可约时段 + 可转发草稿 | Python，配合飞书 calendar/contact API |
+| [**interview-guide**](skills/interview-guide) | 面试考核维度问答：照5张评分表出4轮考察重点+定制问题（行为+情境+简历追问） | 纯文档（prompt 驱动） |
+| [**candidate-nurture**](skills/candidate-nurture) | 候选人保温+面评催收：读对账预警→产出"今天该碰谁+话术"行动清单 | 纯文档，依赖 _daily_review.json |
 | [**talent-profile**](skills/talent-profile) | 候选人匹配覆盖图：JD要求×候选人矩阵，✅/⚠️/❌覆盖度（不打分），横向对比谁缺哪块 | Python，输出 HTML |
-| [**pipeline-dashboard**](skills/pipeline-dashboard) | 招聘管道看板：岗位×阶段漏斗+停滞预警+转化率，HTML可视化 | Python，输出 HTML |
+| [**pipeline-dashboard**](skills/pipeline-dashboard) | 招聘管道看板：岗位×阶段漏斗+停滞预警+转化率，HTML可视化（多维表格当DB） | Python，输出 HTML |
+
+### 飞书 API 契约层 Skill
+
+招聘主线 skill 按需调用这些契约层 skill，不重复造 API 封装：
+
+| Skill | 用途 |
+|-------|------|
+| [**lark-hire**](skills/lark-hire) | 飞书招聘 `/open-apis/hire/v1/*` API 契约（接口/字段/枚举/错误码权威源） |
+| [**lark-calendar-contact**](skills/lark-calendar-contact) | 飞书日历 + 通讯录 API 契约（freebusy 反推空闲） |
+| [**lark-shared**](skills/lark-shared) | 飞书鉴权 + lark-cli 封装契约（鉴权/CLI/易错点） |
+| [**lark-mail**](skills/lark-mail) | 飞书邮箱 API 契约 |
+
+> 飞书相关的 Skill（collect-resumes、recruit-followup 等）依赖 [lark-cli](https://www.npmjs.com/package/@larksuiteoapi/lark-cli) 或等价的飞书开放平台 API 封装。调 `/open-apis/hire/v1/*` 前先读 `lark-hire` skill；调 calendar/contact 前先读 `lark-calendar-contact` skill。
+
+### 通用工具 Skill
+
+| Skill | 用途 | 语言/依赖 |
+|-------|------|-----------|
 | [**neat-freak**](skills/neat-freak) | 会话收尾时对项目文档和 Agent 记忆做"洁癖级"审查与同步，跨平台（Claude Code / Codex / OpenCode / OpenClaw） | 纯文档，无依赖 |
 | [**storage-analyzer**](skills/storage-analyzer) | 只读扫描磁盘占用，生成交互式 HTML 报告，支持网页上一键清理（移废纸篓/直接删），macOS + Windows | Python 3 标准库，零第三方依赖 |
-
-> 飞书相关的 Skill（collect-resumes、recruit-followup）依赖 [lark-cli](https://www.npmjs.com/package/@larksuiteoapi/lark-cli) 或等价的飞书开放平台 API 封装。
 
 ## 设计理念
 
@@ -69,33 +85,34 @@ agent-skills/
 ├── LICENSE                   ← MIT
 ├── CONTRIBUTING.md           ← 贡献指南
 ├── .gitignore
-└── skills/
-    ├── collect-resumes/      ← 收简历+归档（Node.js + 飞书 mail）
-    │   ├── SKILL.md
-    │   ├── README.md
-    │   ├── .env.example
-    │   ├── references/
-    │   └── scripts/
-    ├── analyze-resumes/      ← AI 简历评估（Python + 飞书 document_ai）
-    │   ├── SKILL.md
-    │   ├── .env.example
-    │   ├── references/
-    │   └── scripts/
-    ├── recruit-followup/     ← 候选人跟进全流程（飞书 hire/im/base）
-    │   ├── SKILL.md
-    │   ├── .env.example
-    │   └── scripts/
-    ├── schedule-interview/   ← 面试时间协调（Python + 飞书 calendar/contact）
-    │   ├── SKILL.md
-    │   └── scripts/
-    ├── neat-freak/           ← 文档/记忆洁癖审查（纯文档）
-    │   ├── SKILL.md
-    │   └── references/
-    └── storage-analyzer/     ← 磁盘占用分析（Python 标准库）
-        ├── SKILL.md
-        ├── references/
-        ├── scripts/
-        └── assets/
+├── skills/                   ← Skill 集合
+│   ├── collect-resumes/      ← 收简历+归档（Node.js + 飞书 mail）
+│   │   ├── SKILL.md
+│   │   ├── references/
+│   │   ├── scripts/          ← scan_all/verify_mails/download/redact_salary/verify_archive...
+│   │   │   └── lib/          ← 共享库（manifest/lark_mail/html_links/file_identity...）
+│   │   └── tests/
+│   ├── analyze-resumes/      ← AI 简历评估（Python + 飞书 document_ai）
+│   ├── recruit-followup/     ← 候选人跟进全流程（飞书 hire/im/base）
+│   ├── schedule-interview/   ← 面试时间协调（Python + 飞书 calendar/contact）
+│   ├── interview-guide/      ← 面试考核维度问答（纯文档）
+│   ├── candidate-nurture/    ← 候选人保温+面评催收（纯文档）
+│   ├── talent-profile/       ← 候选人匹配覆盖图（Python）
+│   ├── pipeline-dashboard/   ← 招聘管道看板（Python）
+│   ├── lark-hire/            ← 飞书招聘 API 契约层
+│   ├── lark-calendar-contact/← 飞书日历+通讯录 API 契约层
+│   ├── lark-shared/          ← 飞书鉴权+CLI 契约层
+│   ├── lark-mail/            ← 飞书邮箱 API 契约层
+│   ├── neat-freak/           ← 文档/记忆洁癖审查（纯文档）
+│   └── storage-analyzer/     ← 磁盘占用分析（Python 标准库）
+└── notes/                    ← 招聘主线 skill 共享的核心脚本（数据文件已 gitignore）
+    ├── _lark_shared.py       ← 飞书鉴权 + lark-cli 封装（被所有脚本依赖）
+    ├── _hire.py              ← 候选人录入飞书招聘
+    ├── _daily_review.py      ← 每日对账（ATS→跟踪表同步）
+    ├── _download_chat_file.py← 群聊文件下载
+    ├── _sync_tables.py       ← 表格定时同步
+    ├── refresh_my_jobs.py    ← 岗位范围刷新
+    └── setup_daily_sync.ps1  ← 定时任务安装
 ```
 
 ## Skill 规范

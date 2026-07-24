@@ -9,7 +9,7 @@ description: >
   覆盖：岗位×阶段漏斗图、停滞候选人高亮、分岗位明细、转化率计算。
   不覆盖：每日作战清单（见recruit-followup日报，短期行动导向）、
   数据计算（读_daily_review.py产出，不重算）、候选人保温（见candidate-nurture）。
-  依赖：notes/_daily_report.json（每日对账产出）、多维表格跟踪表。
+  依赖：notes/_daily_review.json（每日对账产出，契约见 recruit-followup/references/review-contract.md）、多维表格跟踪表。
 ---
 
 # 人才管道管理看板
@@ -36,7 +36,7 @@ description: >
 ## 工作流
 
 ```
-① 读数据      _daily_report.json（ATS数据+跟踪表+日程）
+① 读数据      _daily_review.json（ATS数据+跟踪表+日程）
     ↓
 ② 聚合        按岗位×阶段聚合人数，算停滞天数
     ↓
@@ -93,7 +93,7 @@ description: >
 
 ### `scripts/generate_dashboard.py`
 
-读 `_daily_report.json` → 聚合 → 输出 HTML。
+读 `_daily_review.json` → 聚合 → 输出 HTML。
 
 ```bash
 # 前置：先跑对账生成报告
@@ -101,7 +101,7 @@ python notes/_daily_review.py
 
 # 生成看板
 python "C:/Users/wuchunbo/.agents/skills/pipeline-dashboard/scripts/generate_dashboard.py" \
-  --report notes/_daily_report.json \
+  --report notes/_daily_review.json \
   --output notes/pipeline-dashboard.html
 
 # 浏览器打开
@@ -109,7 +109,7 @@ start notes/pipeline-dashboard.html
 ```
 
 脚本逻辑（纯数据聚合 + HTML 渲染，不调 AI）：
-1. 读 `_daily_report.json` 的 `ats_people`（含 stage/dwell_days/name/job）
+1. 读 `_daily_review.json` 的 `structured.ats`（含 name/job/stage/dwell_days/latest_conclusion/talent_id，契约见 review-contract.md）
 2. 按 job × stage 聚合人数
 3. 算各 stage 的转化率（上游人数 → 下游人数）
 4. 标记停滞候选人（dwell ≥ 阈值）
@@ -121,7 +121,7 @@ start notes/pipeline-dashboard.html
 
 ## 不做的事（显式边界）
 
-- ❌ **不重复算对账数据**——读 `_daily_report.json`，不重新拉飞书 API
+- ❌ **不重复算对账数据**——读 `_daily_review.json`，不重新拉飞书 API
 - ❌ **不替代日报**——看板是管理视图，日报是行动清单，两者并存
 - ❌ **不做候选人保温**——停滞预警只列出来，保温动作归 candidate-nurture
 - ❌ **不做面评分析**——看板只看"流程进展"，面评内容分析归 talent-review（未来）

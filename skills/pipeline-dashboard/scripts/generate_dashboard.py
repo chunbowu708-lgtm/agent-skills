@@ -2,11 +2,12 @@
 """
 generate_dashboard.py — 招聘管道看板 HTML 生成器
 
-读 _daily_report.json → 按岗位×阶段聚合 → 输出 HTML 看板。
+读 _daily_review.json（notes/_daily_review.py 产出）→ 按岗位×阶段聚合 → 输出 HTML 看板。
 纯数据聚合 + 渲染，不调 AI。
+数据契约见 recruit-followup/references/review-contract.md：人员主数据在 structured.ats。
 
 用法：
-  python generate_dashboard.py --report notes/_daily_report.json --output notes/pipeline-dashboard.html
+  python generate_dashboard.py --report notes/_daily_review.json --output notes/pipeline-dashboard.html
 """
 import json, sys, os, argparse, datetime
 from collections import defaultdict, OrderedDict
@@ -29,8 +30,11 @@ def load_report(path):
 def extract_people(report):
     """从报告提取人员列表，返回 [{name, job, stage, dwell_days, conclusion}]"""
     people = []
-    # 兼容多种报告结构
-    ats = report.get("ats_people") or report.get("structured", {}).get("ats_people") or []
+    # 主数据源：structured.ats（见 review-contract.md）；保留旧字段名兜底
+    ats = (report.get("structured", {}).get("ats")
+           or report.get("ats_people")
+           or report.get("structured", {}).get("ats_people")
+           or [])
     for p in ats:
         if not isinstance(p, dict):
             continue
@@ -42,7 +46,7 @@ def extract_people(report):
             "dwell_days": p.get("dwell_days"),
             "conclusion": p.get("latest_conclusion"),
         })
-    # 如果 ats_people 为空，尝试从 battle_list 提取
+    # 如果 ats 为空，尝试从 stuck 提取（降级，只有停滞者）
     if not people:
         bl = report.get("structured", report.get("battle_list", {}))
         for item in bl.get("stuck", []):
@@ -161,7 +165,7 @@ def render_warn_wall(people):
 
 def main():
     ap = argparse.ArgumentParser(description="生成招聘管道看板 HTML")
-    ap.add_argument("--report", default="notes/_daily_report.json", help="对账报告 JSON 路径")
+    ap.add_argument("--report", default="notes/_daily_review.json", help="对账报告 JSON 路径")
     ap.add_argument("--output", default="notes/pipeline-dashboard.html", help="输出 HTML 路径")
     args = ap.parse_args()
 

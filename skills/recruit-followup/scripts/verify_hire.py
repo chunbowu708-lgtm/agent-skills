@@ -14,35 +14,25 @@ verify_hire.py — 录入后验证闸门（read-only，绝不写盘/删数据）
 
 退出码：0=全过；1=有 STOP
 """
-import subprocess, json, sys, os, re, argparse
+import json, sys, os, re, argparse
 sys.stdout.reconfigure(encoding="utf-8")
 
-# 凭证走环境变量（见 .env.example），不硬编码
-CLI = os.environ.get("LARK_CLI_PATH", "lark-cli")
-BASE = os.environ.get("TRACKING_BASE_TOKEN", "")
-TBL = os.environ.get("TRACKING_TABLE_ID", "")
-RESULT = os.environ.get("HIRE_RESULT_FILE", "notes/_hire_result.json")
+# 复用项目共享库（收口 api/cli/extract_json，含 MSYS_NO_PATHCONV + utf-8 encoding）
+sys.path.insert(0, "F:/miniwanob/notes")
+from _lark_shared import api, cli, extract_json  # noqa: E402
 
-
-def api(method, path, params=None, as_user="bot"):
-    """调 lark-cli api，返回解析后的 json 或 None"""
-    args = ["api", method, path, "--as", as_user]
-    if params:
-        args += ["--params", json.dumps(params, ensure_ascii=False)]
-    r = subprocess.run([CLI] + args, capture_output=True, text=True)
-    m = re.search(r'\{[\s\S]*\}', r.stdout)
-    return json.loads(m.group(0)) if m else None
+BASE = "KRAQbxQR0aj2ymsuZRvcwHLdnKQ"
+TBL = "tblFZcRms15NlGkr"
+RESULT = "notes/_hire_result.json"
 
 
 def list_track_names():
     """拉跟踪表所有候选人名（用于核对建行是否齐全）"""
-    r = subprocess.run([CLI, "base", "+record-list", "--base-token", BASE, "--table-id", TBL,
-                        "--field-id", "候选人", "--format", "json", "--as", "user", "--limit", "200"],
-                       capture_output=True, text=True)
-    m = re.search(r'\{[\s\S]*\}', r.stdout)
-    if not m:
+    raw = cli(["base", "+record-list", "--base-token", BASE, "--table-id", TBL,
+               "--field-id", "候选人", "--format", "json", "--as", "user", "--limit", "200"])
+    d = extract_json(raw)
+    if not d:
         return []
-    d = json.loads(m.group(0))
     rows = d.get("data", {}).get("data", [])
     return [row[0] for row in rows if isinstance(row, list) and row]
 
@@ -133,7 +123,7 @@ def main():
         items = []
         for _ in range(2):
             d = api("GET", "/open-apis/hire/v1/applications",
-                    params={"talent_id": tid, "page_size": "5"}, as_user="bot")
+                    params={"talent_id": tid, "page_size": "5"}, identity="bot")
             items = (d.get("data", {}) or {}).get("items", []) if d else []
             if items:
                 break
