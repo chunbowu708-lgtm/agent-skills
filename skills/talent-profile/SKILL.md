@@ -123,22 +123,29 @@ HR 筛人的真实场景不是"给每个候选人打分"，而是**"同岗位 N 
 
 ### `scripts/generate_profile.py`
 
-输入：评估报告路径 + 岗位文件夹路径
-输出：`<岗位文件夹>/talent-profile.html`
+**接口契约（以脚本 argparse 为准）**：输入是 `--data`（AI 判断结果 JSON，必填）+ `--output`（HTML 输出路径；缺省时打印到 stdout）。**没有 `--report`/`--position` 参数**——解析评估报告、拆要求项、逐格判断都是 AI 在对话中完成的，脚本只渲染。
+
+**完整三步（顺序执行，第 2 步是 AI 的活）**：
 
 ```bash
-python "C:/Users/wuchunbo/.agents/skills/talent-profile/scripts/generate_profile.py" \
-  --report "notes/简历评估_7.01.md" \
-  --position "data/在招岗位候选人管理/.../岗位文件夹"
+# 第1步（AI）：读评估报告 + jd-optimized.md/评估要点.md，完成覆盖判断
+# 第2步（AI）：把判断结果写成 notes/_profile_data.json，结构如下：
+# {
+#   "position": "AI产品经理（UGC游戏平台）",
+#   "requirements": ["AI产品经验", "独立负责模块", "英文可工作", ...],   ← 6-10个要求项
+#   "candidates": [
+#     {"name":"张三", "verdict":"🟢强推", "cells":["✅","✅","⚠️"], "risk":"英文未验证"},
+#     ...                                  ← cells 顺序、长度必须与 requirements 一一对应
+#   ]
+# }
+# 第3步（脚本）：渲染 HTML 到岗位文件夹
+python "…/talent-profile/scripts/generate_profile.py" \
+  --data notes/_profile_data.json \
+  --output "data/在招岗位候选人管理/<团队>/<岗位>/talent-profile.html"
 ```
 
-脚本逻辑：
-1. 解析评估报告（markdown 表格 → 候选人数据）
-2. 读 JD 要求项（jd-optimized.md 的硬卡项/优先项）
-3. AI 逐人逐项判断覆盖度（这部分由 AI 在对话中完成，脚本负责生成 HTML 壳）
-4. 输出 HTML（含样式，离线可看）
-
-> ⚠️ 覆盖判断（✅/⚠️/❌）是判断活，由 AI 在对话中完成，不写死规则。脚本只负责把 AI 判断的结果渲染成 HTML。
+> ⚠️ 覆盖判断（✅/⚠️/❌）是判断活，由 AI 在对话中完成，不写死规则。脚本只负责把 `_profile_data.json` 渲染成 HTML。
+> ⚠️ 自检：写完 JSON 后确认每个候选人的 `cells` 数量 == `requirements` 数量，不一致会导致表格错位。
 
 ---
 

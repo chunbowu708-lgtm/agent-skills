@@ -14,7 +14,7 @@
 | [**recruit-followup**](skills/recruit-followup) | 招聘跟进全流程：候选人录入飞书招聘、邀约信号扫描、面评同步、跟踪表自动更新、每日对账 | 飞书 hire/document_ai/im/base API |
 | [**schedule-interview**](skills/schedule-interview) | 面试时间协调：批量查面试官空闲，和候选人给定时间求交集，产出可约时段 + 可转发给面试官的确认草稿 | Python，配合飞书 calendar/contact API |
 | [**interview-guide**](skills/interview-guide) | 面试考核维度问答：照公司5张评分表出4轮考察重点+定制问题（行为+情境+简历薄弱点追问） | 纯文档（prompt 驱动） |
-| [**candidate-nurture**](skills/candidate-nurture) | 候选人保温+面评催收：读对账预警→产出"今天该碰谁+话术"行动清单 | 纯文档，依赖 _daily_report.json |
+| [**candidate-nurture**](skills/candidate-nurture) | 候选人保温+面评催收：读对账预警+信号判读+保温状态→产出"今天该碰谁+话术+升级标注"行动清单，触达状态跨天延续（话术自动升级/去重/终止提示） | Python 脚本（`nurture_state.py`），依赖 `_daily_review.json` + `_signals.json` |
 | [**talent-profile**](skills/talent-profile) | 候选人匹配覆盖图：JD要求×候选人矩阵，✅/⚠️/❌覆盖度（不打分），横向对比谁缺哪块 | Python，输出 HTML |
 | [**pipeline-dashboard**](skills/pipeline-dashboard) | 招聘管道看板：岗位×阶段漏斗+停滞预警+转化率，HTML可视化 | Python，输出 HTML |
 | [**neat-freak**](skills/neat-freak) | 会话收尾时对项目文档和 Agent 记忆做"洁癖级"审查与同步，跨平台（Claude Code / Codex / OpenCode / OpenClaw） | 纯文档，无依赖 |
@@ -51,15 +51,13 @@ cp -r agent-skills/skills/<skill-name> ~/.agents/skills/
 
 ## 配置
 
-招聘相关 skill（collect-resumes、recruit-followup）需要配置环境变量。复制对应 skill 下的 `.env.example` 为 `.env` 并填入你自己的值：
+**凭证一律走环境变量，代码里不硬编码。** 使用前按各 skill 的 `SKILL.md` 说明设置：
 
-```bash
-cp skills/collect-resumes/.env.example skills/collect-resumes/.env
-cp skills/recruit-followup/.env.example skills/recruit-followup/.env
-# 然后编辑 .env 填入你的飞书应用凭证、归档路径等
-```
+- `LARK_CLI_PATH`：lark-cli 可执行文件路径（Windows 下是 `.../lark-cli.cmd`），不设则用 PATH 里的 `lark-cli`
+- `PROJECT_ROOT`：你的项目根目录（`notes/`、`data/` 的上级），不设则用当前工作目录
+- 招聘表 ID（`TRACKING_BASE_TOKEN` / `TRACKING_TABLE_ID` / `CANDIDATE_TABLE_ID` 等）：见 `recruit-followup/references/lark-cli-base-commands.md`
 
-**仓库里已经过脱敏处理**，所有 App ID / App Secret / 内部群 ID / 业务表 ID / 内部路径都已替换成占位符。fork 或使用前请填入你自己的值。
+**仓库里已经过脱敏处理**，所有 App ID / App Secret / 内部群 ID / 业务表 ID / 内部路径都已替换成占位符或环境变量读法。fork 或使用前请填入你自己的值。
 
 ## 目录结构
 
@@ -72,21 +70,19 @@ agent-skills/
 └── skills/
     ├── collect-resumes/      ← 收简历+归档（Node.js + 飞书 mail）
     │   ├── SKILL.md
-    │   ├── README.md
-    │   ├── .env.example
     │   ├── references/
     │   └── scripts/
+    │       └── lib/          ← 共享模块（路径常量、重试、manifest 等）
     ├── analyze-resumes/      ← AI 简历评估（Python + 飞书 document_ai）
     │   ├── SKILL.md
-    │   ├── .env.example
     │   ├── references/
     │   └── scripts/
     ├── recruit-followup/     ← 候选人跟进全流程（飞书 hire/im/base）
     │   ├── SKILL.md
-    │   ├── .env.example
     │   └── scripts/
     ├── schedule-interview/   ← 面试时间协调（Python + 飞书 calendar/contact）
     │   ├── SKILL.md
+    │   ├── references/
     │   └── scripts/
     ├── neat-freak/           ← 文档/记忆洁癖审查（纯文档）
     │   ├── SKILL.md

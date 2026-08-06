@@ -9,7 +9,7 @@ description: >
   覆盖：岗位×阶段漏斗图、停滞候选人高亮、分岗位明细、转化率计算。
   不覆盖：每日作战清单（见recruit-followup日报，短期行动导向）、
   数据计算（读_daily_review.py产出，不重算）、候选人保温（见candidate-nurture）。
-  依赖：notes/_daily_report.json（每日对账产出）、多维表格跟踪表。
+  依赖：notes/_daily_review.json（每日对账产出，契约见 recruit-followup/references/review-contract.md）、多维表格跟踪表。
 ---
 
 # 人才管道管理看板
@@ -36,56 +36,33 @@ description: >
 ## 工作流
 
 ```
-① 读数据      _daily_report.json（ATS数据+跟踪表+日程）
+① 读数据      _daily_review.json（ATS数据+跟踪表+日程）
     ↓
 ② 聚合        按岗位×阶段聚合人数，算停滞天数
     ↓
-③ 渲染看板    HTML（漏斗图 + 岗位明细表 + 停滞预警墙）
+③ 渲染看板    HTML（分工作室卡片 + 色块漏斗 + 预警区）
     ↓
 ④ 落盘+打开   HTML存notes/，浏览器打开
 ```
 
 ---
 
-## 看板包含三个视图
+## 看板包含三个区域（v2，2026-08-04 重写）
 
-### 视图1：全局漏斗（所有岗位汇总）
+### 区域1：全局漏斗（横向色块条）
 
-```
-初筛(25人) → 待约面(12人) → 一面(8人) → 二面(4人) → Offer(1人) → 入职(0人)
-                ↑                                    ↑
-             卡在这里                              卡在这里
-```
+所有岗位汇总的阶段分布，用 CSS 色块条呈现（初筛灰→初试蓝→复试黄→终试橙→HR面绿→Offer深绿），每个色块显示人数，鼠标悬停看该阶段候选人列表。瓶颈阶段（人数最多）高亮。
 
-- 每个阶段显示人数
-- 用颜色标瓶颈（堆积最多的阶段 = 红色）
-- 算各阶段转化率（初筛→一面 = 32%）
+### 区域2：分工作室管道卡片
 
-### 视图2：分岗位明细（矩阵表）
+每个工作室一张卡片，卡片内每岗位一行，用**色块圆点**（每人一个圆点，颜色=所在阶段）展示漏斗分布，鼠标悬停看候选人姓名+停留天数。卡片末尾标该岗位关键信号（堵面评/高危停滞/仅N人）。
 
-| 岗位 | 初筛 | 待约面 | 一面 | 二面 | Offer | 入职 | 停滞数 | 状态 |
-|------|------|--------|------|------|-------|------|--------|------|
-| AI产品经理 | 3 | 2 | 1 | 0 | 0 | 0 | 2 | 🔴堆积 |
-| Spine动作 | 5 | 3 | 0 | 0 | 0 | 0 | 3 | 🟠慢 |
-| Unity开发 | 2 | 1 | 1 | 1 | 0 | 0 | 0 | 🟢正常 |
+### 区域3：预警与推送提醒
 
-- 按岗位分行，阶段为列
-- "停滞数"列高亮（≥3 = 🔴）
-- 点击岗位名展开看具体候选人（折叠区）
-
-### 视图3：停滞预警墙
-
-```
-🔴 停滞 ≥5天（高危，可能流失）
-  李四 - AI产品经理 - 卡在"待约面" 7天
-  王五 - Spine动作 - 卡在"二面后" 6天
-
-🟠 停滞 3-4天（需关注）
-  ...
-
-🟡 面评欠收
-  张三 - 一面过3天无面评（→ candidate-nurture 催收）
-```
+三类预警分卡片呈现：
+- 🔴 **高危停滞**（≥15天，流失风险）：候选人+岗位+停留天数+动作
+- 🟣 **面评阻塞**（已面完等评）：候选人+面试官+欠评天数+动作
+- ⚡ **急需补人**（在途≤2人岗位）：岗位+人数+动作
 
 ---
 
@@ -93,15 +70,15 @@ description: >
 
 ### `scripts/generate_dashboard.py`
 
-读 `_daily_report.json` → 聚合 → 输出 HTML。
+读 `_daily_review.json` → 聚合 → 输出 HTML。
 
 ```bash
 # 前置：先跑对账生成报告
 python notes/_daily_review.py
 
 # 生成看板
-python "C:/Users/wuchunbo/.agents/skills/pipeline-dashboard/scripts/generate_dashboard.py" \
-  --report notes/_daily_report.json \
+python "…/pipeline-dashboard/scripts/generate_dashboard.py" \
+  --report notes/_daily_review.json \
   --output notes/pipeline-dashboard.html
 
 # 浏览器打开
@@ -109,23 +86,22 @@ start notes/pipeline-dashboard.html
 ```
 
 脚本逻辑（纯数据聚合 + HTML 渲染，不调 AI）：
-1. 读 `_daily_report.json` 的 `ats_people`（含 stage/dwell_days/name/job）
-2. 按 job × stage 聚合人数
-3. 算各 stage 的转化率（上游人数 → 下游人数）
-4. 标记停滞候选人（dwell ≥ 阈值）
-5. 套 HTML 模板输出
+1. 读 `_daily_review.json` 的 `structured.ats`（含 name/job/dept/stage/dwell_days/latest_conclusion/interview_count/talent_id，契约见 review-contract.md）
+2. 用 `interview_count` + `latest_conclusion` 推断每人所在漏斗阶段（初筛/初试/复试/终试/HR面/Offer）
+3. 按 dept（工作室）→ job（岗位）分组
+4. 从 `structured.feedback_overdue` 提取面评阻塞
+5. 算高危停滞（dwell≥15）、急需补人（在途≤2人）
+6. 内嵌 CSS + JS 渲染 HTML（完全自包含，不读外部模板）
 
 > 与 talent-profile 不同：pipeline-dashboard 是**纯数据聚合**（不调 AI 判断），脚本可独立跑完。
+>
+> **注**：v2 脚本完全自包含（CSS/JS 内嵌），不再使用外部 HTML 模板。旧版 `assets/dashboard-template.html` 已删除。
 
 ---
 
 ## 不做的事（显式边界）
 
-- ❌ **不重复算对账数据**——读 `_daily_report.json`，不重新拉飞书 API
+- ❌ **不重复算对账数据**——读 `_daily_review.json`，不重新拉飞书 API
 - ❌ **不替代日报**——看板是管理视图，日报是行动清单，两者并存
 - ❌ **不做候选人保温**——停滞预警只列出来，保温动作归 candidate-nurture
 - ❌ **不做面评分析**——看板只看"流程进展"，面评内容分析归 talent-review（未来）
-
-## assets
-
-- `assets/dashboard-template.html` — 看板 HTML 模板（含漏斗图样式 + 矩阵表 + 折叠区）

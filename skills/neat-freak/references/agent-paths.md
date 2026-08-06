@@ -1,68 +1,72 @@
-# Agent 记忆与配置路径速查
+# Claude / Codex 路径、加载和体量速查
 
-不同 agent 平台的记忆系统和项目配置文件位置不一样。执行第一步盘点时按你正在使用的平台查这张表。
+平台机制会变。先探测当前环境和本机规则；涉及写入或尺寸上限时，优先核对当前官方文档或本机工具输出，不把这张表当永远不变的事实。
+
+## 通用原则
+
+- 区分三类文件：人工维护的规则、Agent 自动记忆、机器生成的历史/索引。它们不能共用同一套写入规则。
+- `MEMORY.md` 只是文件名，不代表跨平台语义相同。尺寸阈值必须绑定平台和文件类型。
+- 规则真身可能是 CLAUDE.md、AGENTS.md、override、导入或软链；以当前工作空间声明和实际加载链为准。
+- 发现多个平台目录不等于每个平台都在使用。只审当前运行平台和用户明确纳入的安装面。
 
 ## Claude Code
 
-| 用途 | 路径 |
+| 用途 | 常见路径 / 规则 |
 |---|---|
-| 跨会话记忆(全局) | `~/.claude/projects/<encoded-project-path>/memory/` |
-| 记忆索引文件 | `~/.claude/projects/<...>/memory/MEMORY.md` |
-| 全局指令 | `~/.claude/CLAUDE.md` |
-| 项目级指令 | 项目根 `CLAUDE.md`(可层级嵌套) |
-| Skills 目录 | `~/.claude/skills/<name>/SKILL.md` |
+| 用户指令 | `~/.claude/CLAUDE.md` |
+| 项目指令 | `./CLAUDE.md`、`./.claude/CLAUDE.md`、`CLAUDE.local.md` |
+| 路径规则 | `.claude/rules/**/*.md` |
+| 自动记忆 | `~/.claude/projects/<project>/memory/` |
+| 自动记忆索引 | 上述目录的 `MEMORY.md` |
+| Skills | `~/.claude/skills/<name>/SKILL.md` 或项目 `.claude/skills/` |
 
-记忆文件用 YAML frontmatter:`name`、`description`、`type`(user / feedback / project / reference)。
+当前官方口径：
+
+- CLAUDE.md 全量加载，但建议目标少于约 200 行；越长越消耗注意力并降低遵守度。这是质量预算，不是硬截断线。
+- Claude 自动记忆 `MEMORY.md` 在会话启动时只加载前 200 行或 25KB（先到者）；主题文件按需读取。这个硬限制只属于 Claude 自动记忆，不适用于 Codex 生成记忆。
+- Claude 原生读 CLAUDE.md。已有 AGENTS.md 的项目可用导入或软链同源；方向由项目规则决定，不擅自翻转。
 
 ## OpenAI Codex
 
-| 用途 | 路径 |
+| 用途 | 常见路径 / 规则 |
 |---|---|
-| 跨会话指令(全局) | `~/.codex/AGENTS.md` 或 `$CODEX_HOME/AGENTS.md` |
-| 项目级指令 | 项目根 `AGENTS.md`(可层级嵌套) |
-| 项目级 override | `AGENTS.override.md`(若存在,覆盖同目录 AGENTS.md) |
-| Skills 目录 | `~/.codex/skills/<name>/SKILL.md` 或项目内 `.codex/skills/<name>/` |
+| Codex home | `$CODEX_HOME`，默认 `~/.codex` |
+| 全局指令 | `$CODEX_HOME/AGENTS.override.md`，不存在时读 `AGENTS.md` |
+| 项目指令 | 从项目根到当前目录逐级找 `AGENTS.override.md`、`AGENTS.md`、配置的 fallback |
+| 全局 Skills | `$CODEX_HOME/skills/<name>/SKILL.md` |
+| 项目 Skills | 项目 `.codex/skills/<name>/`（以当前 Codex 版本和环境为准） |
 
-Codex 没有独立的"记忆文件 + 索引"机制,所有跨会话信息都直接写在 `AGENTS.md` 里。同步时把"项目事实"那部分内容统一放 AGENTS.md。
+当前官方口径：项目指令链合并后默认最多 32KiB，由 `project_doc_max_bytes` 控制；越靠近当前目录的指令越晚加载。检查 override 和 fallback，不能只找根目录 AGENTS.md。
 
-发现项目里有 `TEAM_GUIDE.md` 或 `.agents.md` 也要看——这是 Codex 的 fallback 文件名。
+某些 Codex 环境还提供 `~/.codex/memories/`、rollout summaries 或 Chronicle 派生索引。这类文件可能由宿主管线生成：
 
-## OpenClaw
+- 先读当前环境给出的 memory instructions；没有明确授权时只读。
+- 不直接改生成的 `MEMORY.md`、`memory_summary.md`、`raw_memories.md` 或 rollout summary。
+- 用户明确要求更新记忆且环境允许时，只使用该 Codex 环境规定的 correction input，或通过官方 `/memories`、设置和 `memories.*` 配置控制生成与使用，再等待宿主 consolidation；不要自设文件尺寸目标、compact candidate 或项目级生成记忆门禁。
 
-| 用途 | 路径 |
-|---|---|
-| 用户级 skills | `~/.openclaw/skills/<name>/SKILL.md`（首次运行自动创建） |
-| 项目级 skills | `.openclaw/skills/<name>/SKILL.md`（仓库根目录下） |
-| Workspace skills | 当前 workspace 的 `skills/` 目录 |
+发现 `TEAM_GUIDE.md`、`.agents.md` 等文件时，只有它们出现在 Codex fallback 配置中才把它们当指令文件。
 
-**加载优先级**：workspace > project-agent > personal-agent > managed/local > bundled > extra dirs。同名 skill 高优先级覆盖低优先级。
+## 其他 Agent Skills 平台（Qoder、Kimi Code、iFlow、CodeBuddy、Cursor、Gemini CLI 等）
 
-OpenClaw 没有独立的"记忆文件 + 索引"机制，跨会话信息可放在项目根的 markdown（CLAUDE.md / AGENTS.md / 等价文件）里，参照 Codex 的做法。frontmatter 支持 `metadata.openclaw` 字段做加载时的 gating（按 OS、环境变量、二进制依赖筛选），但不是 neat-freak 必需的。
+Agent Skills 是开放标准（2025-12 由 Anthropic 开放），已有约 40 个产品兼容本 skill 的分发格式。Claude Code 和 Codex 之外的平台不逐一维护速查表，用通用探测法：
 
-## OpenCode
+1. **规则文件**：在项目根和上级目录找 `AGENTS.md`（跨平台事实标准）、`CLAUDE.md`，以及平台专属形态（如 `.cursor/rules/`、`.cursorrules`、平台设置里的项目指令）。哪份实际被加载，以当前平台文档和诊断入口为准，不猜。
+2. **三分法归类**：把发现的每个知识文件归入三类之一——人工维护的规则、Agent 自动记忆、机器生成的历史/索引。归类不明时按机器生成处理（最保守）。
+3. **记忆边界**：未知平台的记忆机制找不到官方控制面时默认只读；不把任何其他平台的尺寸阈值或写入规则套过来。
+4. **降级用法**：宿主不支持 Agent Skills 时本 skill 仍可用——把 SKILL.md 全文作为规则文件或对话指令交给 Agent，references 内容按需跟进；执行边界不变。
 
-| 用途 | 路径 |
-|---|---|
-| 全局配置 | `~/.config/opencode/` |
-| 项目配置 | `.opencode/` |
-| Skills 目录(项目) | `.opencode/skills/`、`.claude/skills/`、`.codex/skills/` 都会被扫描 |
-| Skills 目录(全局) | `~/.config/opencode/skills/`、`~/.claude/skills/`、`~/.codex/skills/` |
+## 共存检查
 
-OpenCode 同时读取 Claude Code 和 Codex 的目录,所以同一个 skill 装在 `~/.claude/skills/` 下的话三家都能识别。OpenClaw 走自己的 `~/.openclaw/skills/`，需要单独装一份（或用符号链接）。
+1. 列出实际存在的平台目录和 skill realpath。
+2. 核对同名 skill 是否软链到同一真身、复制安装、或由更高优先级版本覆盖。
+3. 只改权威真身；复制安装需要明确同步机制，不能假设会自动更新。
+4. 软链在 Windows 或受限环境可能不可用，允许项目采用导入或生成镜像，只要现场规则明确且有一致性门禁。
+5. 验证加载而不是只验证文件存在：使用平台提供的 instruction/skill list、`/memory`、status 或等价诊断入口。
 
-## 如果当前 agent 没有独立记忆系统
+## 官方复核入口
 
-跳过"记忆"那一层,把功夫全花在:
-- 项目根 markdown(CLAUDE.md / AGENTS.md / 本平台等价文件)
-- README.md
-- docs/
-
-仍然是有效的同步——记忆是锦上添花,docs 才是项目知识的最低保障。
-
-## 跨平台共存策略
-
-如果一个项目同时被 Claude Code 用户和 Codex 用户使用,推荐:
-
-- **项目根同时放 `CLAUDE.md` 和 `AGENTS.md`**,内容可以互相 symlink 或在两边维护
-- 或者一份内容主文件 + 另一份用一行 `See CLAUDE.md` 跳转
-- docs/ 和 README 是平台中立的,不需要分两份
+- Agent Skills specification: <https://agentskills.io/specification>
+- Agent Skills 兼容产品名录: <https://agentskills.io>（showcase）
+- Claude Code memory and CLAUDE.md: <https://code.claude.com/docs/en/memory>
+- OpenAI Codex AGENTS.md: <https://developers.openai.com/codex/guides/agents-md/>
+- OpenAI Codex Memories: <https://learn.chatgpt.com/docs/customization/memories>

@@ -2,17 +2,17 @@
 """
 match_schedule.py — 面试时间协调核心脚本
 
-做两件事：
-  1. 调 lark-cli calendar +suggestion 拿面试官共同空闲块
-  2. 本地把"候选人给的候选日"和空闲块求交，产出可约时段 + 可转发草稿
+做三件事（输出透明四段，每个时间都可追溯到 freebusy 实查）：
+  1. 调 lark-cli calendar +freebusy 拿面试官真实忙碌段（ground truth）
+  2. 反推空闲段（全天-会议-午休），多面试官取交集
+  3. 空闲 ∩ 候选人日期求交，按黄金时段选建议，产出可转发草稿
 
 设计要点（踩坑固化）：
   - subprocess 调 lark-cli 用全路径 .cmd（Windows 下 "lark-cli" 报 WinError 2）
   - 星期推断用 datetime，绝不手算（手算必错）
   - 工作时间默认 09:00-18:00，午休 12:00-13:30 自动排除
   - 候选人时间可能是模糊的（"周四"=当天全天）或精确的（"周四 16:00"）
-  - 输出写文件再让 AI Read，避免 Windows GBK 乱码
-  - suggestion 返回的空闲块用"完全空闲"判断过滤冲突方案
+  - 草稿绝对日期由候选人匹配结果（hits 的 wd/date_str）直接生成，不靠文本替换
 
 用法：
   # 基础：1个面试官 + 多候选人各给候选日
@@ -27,12 +27,66 @@ match_schedule.py — 面试时间协调核心脚本
   # 自定义工作时间范围
   python match_schedule.py --interviewer 谢坤 --candidates "罗艺=周四" --duration 45 --work-start 10:00 --work-end 19:00
 """
-import subprocess, json, sys, os, datetime, argparse, re
+
+# === 自动内联的 lark-cli 封装（由 sync_to_opensource.py 从 _lark_shared 抽出，开源版自包含）===
+import subprocess, json, re as _re, os as _os, shutil
+# 凭证走环境变量（见 .env.example），不硬编码
+# Windows 下 subprocess 不走 PATHEXT，裸 "lark-cli" 会 WinError 2，探测 .cmd 扩展
+_cli_env = _os.environ.get("LARK_CLI_PATH")
+if _cli_env:
+    CLI = _cli_env
+elif shutil.which("lark-cli"):
+    CLI = shutil.which("lark-cli")
+else:
+    # Windows 最后兜底：npm 全局装的话在 AppData/Roaming/npm/
+    _win_guess = _os.path.expanduser("~/AppData/Roaming/npm/lark-cli.cmd")
+    CLI = _win_guess if _os.path.exists(_win_guess) else "lark-cli"
+
+def cli(args, timeout=120):
+    """跑 lark-cli 子命令，返回 stdout+stderr 合并文本。"""
+    env = dict(_os.environ, MSYS_NO_PATHCONV="1")  # 防 git-bash 吃掉 /open-apis 前导斜杠
+    r = subprocess.run([CLI] + args, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=timeout, env=env)
+    return (r.stdout or "") + (r.stderr or "")
+
+def extract_json(raw):
+    """从混了 tip/日志的 lark-cli 输出里抠出第一个 JSON 对象。"""
+    m = _re.search(r'\{[\s\S]*\}', raw)
+    return json.loads(m.group(0)) if m else None
+
+# token 过期/无效错误码（lark-cli 错误响应里常见）
+_TOKEN_ERR_CODES = {99991661, 99991663, 99991664, 99991668, 99991679}
+
+def api(method, path, identity="bot", params=None, data=None, timeout=120):
+    """调 lark-cli api（hire/document_ai 域）。返回解析后的 dict；失败 None。
+    token 过期会抛 RuntimeError 提示重跑授权（避免静默失败让下游崩在 .get() 上）。"""
+    args = ["api", method, path, "--as", identity]
+    if params:
+        args += ["--params", json.dumps(params, ensure_ascii=False)]
+    if data is not None:
+        args += ["--data", json.dumps(data, ensure_ascii=False)]
+    raw = cli(args, timeout=timeout)
+    d = extract_json(raw)
+    if d is None:
+        raise RuntimeError(f"lark-cli 无 JSON 返回，原始输出前 200 字: {raw[:200]}")
+    # lark-cli 失败包成 {ok:false, error:{code,message}}；成功包成 {ok:true, data:{...}}
+    if d.get("ok") is False:
+        err = d.get("error", {}) or {}
+        code = err.get("code", 0)
+        if code in _TOKEN_ERR_CODES:
+            raise RuntimeError(f"token 过期/无效 (code={code})，请重跑 lark-cli auth login")
+        raise RuntimeError(f"lark-cli 调用失败 code={code}: {err.get('message', '')[:200]}")
+    return d
+# === 内联封装结束 ===
+
+
+import json, sys, os, datetime, argparse, re
 sys.stdout.reconfigure(encoding="utf-8")
 
-CLI = r"C:\Users\wuchunbo\AppData\Roaming\npm\lark-cli.cmd"
-CACHE = "notes/interviewers.json"
-OUTPUT = "notes/_schedule_match.txt"
+# 复用项目共享库（收口 cli/extract_json，含 MSYS_NO_PATHCONV + utf-8 encoding + timeout）
+PROJECT_ROOT = os.environ.get("PROJECT_ROOT", os.getcwd())
+CACHE = os.path.join(PROJECT_ROOT, "notes", "interviewers.json")
+ATS_FILE = os.path.join(PROJECT_ROOT, "notes", "_daily_review.json")  # 岗位/进展/轮次的数据源（recruit-followup 产出）
 
 # 星期映射（周一=0）
 WEEKDAY_MAP = {
@@ -49,33 +103,45 @@ TZ = datetime.timezone(datetime.timedelta(hours=8))  # Asia/Shanghai
 
 
 def run_lark(args):
-    """调 lark-cli，返回解析后的 JSON。stdout+stderr 合并看（错误常在 stderr）。"""
-    cmd = [CLI] + args
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        out = (r.stdout or "") + (r.stderr or "")
-        data = json.loads(out)
-        if not data.get("ok", True):
-            print(f"[⚠️ lark-cli 返回 ok=false] {data.get('error',{})}")
-        return data
-    except json.JSONDecodeError:
-        raise RuntimeError(f"lark-cli 返回非 JSON: {out[:500]}")
-    except Exception as e:
-        raise RuntimeError(f"调 lark-cli 失败: {e}")
+    """调 lark-cli，返回解析后的 JSON dict。走 cli（已设 MSYS_NO_PATHCONV + timeout + encoding）。
+    ok=false 时区分 token 类错误（99991663/99991664）明确提示，避免和"无数据"混淆。"""
+    raw = cli(args)  # stdout+stderr 合并文本（cli 已含 env/encoding/timeout）
+    data = extract_json(raw)
+    if data is None:
+        raise RuntimeError(f"lark-cli 返回非 JSON: {raw[:500]}")
+    if not data.get("ok", True):
+        err = data.get("error", {}) or {}
+        code = err.get("code") or data.get("code")
+        # token 类错误码（飞书通用）：99991663 token 过期 / 99991664 token 无效 / 99991661 缺权限
+        if str(code) in ("99991663", "99991664", "99991661"):
+            print(f"[❌ 鉴权失败 code={code}] {err.get('message','') or err}")
+            print("    可能是 tenant_access_token 过期（2小时有效）。建议重跑触发 token 刷新，或检查 lark-cli 登录状态。")
+        else:
+            print(f"[⚠️ lark-cli 返回 ok=false code={code}] {err}")
+    return data
 
 
 def load_cache():
-    """加载面试官缓存。按 open_id 存，但查找要按 name/alias。"""
+    """加载面试官缓存。按 open_id 存，但查找要按 name/alias。
+    文件损坏（并发写坏/手动编辑坏）时降级返回 {}，不阻塞主流程。"""
     if os.path.exists(CACHE):
-        with open(CACHE, encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(CACHE, encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[⚠️ 缓存损坏] {CACHE}: {e}，降级用空缓存（首次跑会重建）")
+            return {}
     return {}
 
 
 def save_cache(cache):
+    """原子写：先写 .tmp 再 os.replace，避免并发写一半被另一进程读到坏文件。
+    无文件锁——多 agent 并发写仍可能后写覆盖先写（丢失新条目），但不会留下损坏的 JSON。"""
     os.makedirs(os.path.dirname(CACHE), exist_ok=True)
-    with open(CACHE, "w", encoding="utf-8") as f:
+    tmp = CACHE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CACHE)  # 原子替换（Windows/POSIX 都支持）
 
 
 def find_in_cache(cache, name):
@@ -92,14 +158,13 @@ def search_interviewer(name):
     data = run_lark([
         "contact", "+search-user",
         "--query", name,
-        "--has-chatted",
         "--as", "user",
         "--format", "json",
     ])
     users = data.get("data", {}).get("users", [])
     if not users:
         return None
-    # 取第一个匹配（has_chatted=true 已过滤掉陌生人）
+    # 取第一个匹配（故意不带 --has-chatted，避免陌生人面试官被过滤——见 SKILL.md 踩坑固化第10条）
     u = users[0]
     oid = u["open_id"]
     info = {
@@ -138,25 +203,203 @@ def resolve_interviewers(names):
     return oids, labels
 
 
+# ============================================================
+# ATS 数据消费（吃 _daily_review.json，自动补草稿五要素）
+# ============================================================
+def load_ats_data(ats_file=None):
+    """读 _daily_review.json，返回 (by_tid, by_name) 两个索引。
+    by_tid: {talent_id: ats_record}（精确匹配，AI 传 --talent-ids 时用）
+    by_name: {name: [ats_record, ...]}（按姓名兜底，同名可能多条）
+    """
+    path = ats_file or ATS_FILE
+    if not os.path.exists(path):
+        return {}, {}
+    try:
+        d = json.load(open(path, encoding="utf-8"))
+    except Exception as e:
+        print(f"[⚠️ ATS 读取失败] {path}: {e}")
+        return {}, {}
+    ats = d.get("structured", {}).get("ats", []) or []
+    by_tid = {a["talent_id"]: a for a in ats if a.get("talent_id")}
+    by_name = {}
+    for a in ats:
+        nm = a.get("name")
+        if nm:
+            by_name.setdefault(nm, []).append(a)
+    return by_tid, by_name
+
+
+def match_ats(name, talent_id, by_tid, by_name):
+    """为候选人匹配 ATS 记录。优先 talent_id 精确匹配，回退姓名。
+    返回 ats_record 或 None。同名歧义时返回 None 并打印告警（让 AI 介入）。
+    """
+    if talent_id and talent_id in by_tid:
+        return by_tid[talent_id]
+    hits = by_name.get(name, [])
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        print(f"[⚠️ 同名歧义] '{name}' 在 ATS 有 {len(hits)} 条，请传 --talent-ids 精确指定")
+        return None
+    return None
+
+
+# 面试轮次角色映射（interview_count → 这轮叫什么面）
+# 写死规则，不再靠 AI 临场编。可按团队实际流程微调。
+_ROUND_ROLE = {
+    1: "初面",
+    2: "复试",
+    3: "三面",
+    4: "四面",
+    5: "五面",
+}
+
+
+def progress_text(stage, interview_count, latest_conclusion):
+    """把 ATS 字段转成草稿话术。
+    返回 (progress_str, role_str)：
+      progress_str: "初试已通过，安排复试" / "安排初面"
+      role_str: 这轮角色（"初面"/"复试"/"三面"/...）——即当前要安排的这一轮
+    缺字段时返 (None, None)——调用方据此标【需问用户】。
+
+    核心逻辑：interview_count=已面完轮数，latest_conclusion=最近一轮结论。
+      已面0轮           → 当前是初面（安排初面）
+      已面N轮且最近通过 → 当前是第N+1轮（上轮已通过，安排这轮）
+    """
+    # 非"面试"阶段不算面试轮次（如简历评估/Offer 阶段），返 None 让 AI 处理
+    if stage != "面试":
+        return None, None
+    done = int(interview_count or 0)  # 已面完的轮数
+    if done == 0:
+        # 还没面过，这是初面
+        return "安排初面", "初面"
+    # 已面 done 轮，当前要安排第 done+1 轮
+    cur = done + 1
+    cur_role = _ROUND_ROLE.get(cur, f"第{cur}面")
+    prev_role = _ROUND_ROLE.get(done, f"第{done}面")
+    # latest_conclusion: 1=通过, 2=不通过, null=未提交面评
+    if latest_conclusion == 1:
+        return f"{prev_role}已通过，安排{cur_role}", cur_role
+    elif latest_conclusion == 2:
+        return f"{prev_role}（⚠️ 上轮conclusion=不通过，请人工核实）", cur_role
+    else:
+        # 未提交面评，按流程推进
+        return f"{prev_role}已面，安排{cur_role}", cur_role
+
+
+def build_header(ats_records, form, team_override=None):
+    """构造草稿标题行：{团队}——{岗位}{形式}面试
+    多人岗位相同时合并写一个岗位；岗位不同时标题只写团队（岗位跟人名走，见候选人块）。
+    团队岗位用"——"间隔（用户明确：长青工作室——3D角色设计师，不要连写）。
+    """
+    depts = set()
+    jobs = set()
+    for a in ats_records:
+        if not a:
+            continue
+        depts.add(team_override or a.get("dept", ""))
+        jobs.add(a.get("job", ""))
+    depts.discard("")
+    jobs.discard("")
+    if not depts and not jobs:
+        return None
+    team_part = "、".join(sorted(depts)) if depts else ""
+    job_part = ""
+    if len(jobs) == 1:
+        job_part = "——" + next(iter(jobs)) if jobs else ""
+    elif len(jobs) > 1:
+        # 岗位不同：标题不列具体岗位，岗位跟人名走（候选人块里"姓名（岗位·轮次）"）
+        job_part = ""
+    return f"{team_part}{job_part}{'视频' if form == '视频' else '线下'}面试"
+
+
+def _job_brief(ats_records, team_override=None):
+    """草稿开头用的精简描述：{团队}——{岗位}（多人岗位相同合并；岗位不同只写团队，岗位跟人名走）。
+    团队岗位用"——"间隔。开头句已含"沟通了一下时间"，形式后缀放结尾行动召唤更自然。
+    """
+    depts = set()
+    jobs = set()
+    for a in ats_records:
+        if not a:
+            continue
+        depts.add(team_override or a.get("dept", ""))
+        jobs.add(a.get("job", ""))
+    depts.discard("")
+    jobs.discard("")
+    if not depts and not jobs:
+        return None  # 全空
+    team_part = "、".join(sorted(depts)) if depts else ""
+    job_part = ""
+    if len(jobs) == 1:
+        job_part = "——" + next(iter(jobs)) if jobs else ""
+    return f"{team_part}{job_part}"
+
+
 def parse_candidate_time(raw, ref_date=None):
     """
     解析候选人给的时间，返回 (date_list, time_hint)。
+    - 支持多个日期：用 `|` 分隔（逗号已被 --candidates 用于分隔候选人）
+      "周一周二" → 内部等价 "周一|周二"；"8-3,8-4" 在 --candidates 里会被拆成两个候选人，
+      所以多日期必须用 `|`：candidates="张三=8-3|8-4"
       - "周四"          → ([绝对日期], None)
       - "周四 16:00"     → ([绝对日期], "16:00")
       - "周四下午"       → ([绝对日期], "下午")  → 后续映射到 14:00-18:00
       - "7-3" / "7月3日" → ([绝对日期], None)
+      - "周一周二"       → ([周一, 周二], None)  ← 连续星期词自动拆
     """
     ref = ref_date or datetime.date.today()
     raw = raw.strip()
 
+    # 把"周一周二""周一到周三"这类连续星期词拆成用 | 分隔（AI 或用户不传 | 时兜底）
+    wk_chain = re.findall(r"[下这本]?(?:周[一二三四五六日天]|星期[一二三四五六日天]|礼拜[一二三四五六日天])", raw)
+    if len(wk_chain) >= 2:
+        # 例："周一周二" → "周一|周二"；"周一到周三" → "周一|周二|周三"
+        # 先按原始顺序取出所有星期词，其余文本按第一个星期词前的内容保留
+        first_idx = raw.find(wk_chain[0])
+        prefix = raw[:first_idx]
+        # 拆连续星期词：逐个解析
+        parts = []
+        for w in wk_chain:
+            parts.append(parse_candidate_time(w, ref)[0])
+        # 展开所有星期词对应的日期
+        all_dates = []
+        for p in parts:
+            all_dates.extend(p)
+        # 若有时间提示（如"周一周二下午"），取第一个星期词后剩余文本里的提示
+        time_hint = None
+        tm = re.search(r"(\d{1,2}[:：]\d{2}|下午|晚上|上午|早上)", raw)
+        if tm:
+            time_hint = tm.group(1).replace("：", ":")
+        return list(dict.fromkeys(all_dates)), time_hint
+
+    # 单日期解析：支持 | 分隔多日期（"8-3|8-4"）
+    if "|" in raw:
+        subs = [s.strip() for s in raw.split("|")]
+        all_dates = []
+        all_hints = []
+        for sub in subs:
+            d, h = parse_candidate_time(sub, ref)
+            all_dates.extend(d)
+            if h:
+                all_hints.append(h)
+        return list(dict.fromkeys(all_dates)), (all_hints[0] if all_hints else None)
+
     # 提取时间部分（如果有）
     time_hint = None
+    # 优先匹配精确时刻 HH:MM / 时段词 / 时间范围（如"9-11点"）
     time_match = re.search(r"(\d{1,2}[:：]\d{2}|上午|下午|早上|晚上)", raw)
     if time_match:
         time_hint = time_match.group(1).replace("：", ":")
         date_raw = raw.replace(time_match.group(0), "").strip()
     else:
-        date_raw = raw
+        # 时间范围如"9-11点"——取起始小时做 time_hint，避免被月日正则误匹配成"9月11日"
+        range_match = re.search(r"(\d{1,2})[-~～到](\d{1,2})\s*点", raw)
+        if range_match:
+            start_h = int(range_match.group(1))
+            time_hint = f"{start_h:02d}:00"
+            date_raw = raw.replace(range_match.group(0), "").strip()
+        else:
+            date_raw = raw
 
     # 解析日期
     dates = []
@@ -194,42 +437,122 @@ def parse_candidate_time(raw, ref_date=None):
     return dates, time_hint
 
 
-def get_freebusy_blocks(oids, start_iso, end_iso):
+def _parse_iso(s):
+    return datetime.datetime.fromisoformat(s)
+
+
+def _subtract_busy(window_start, window_end, busy_list):
+    """从 [window_start, window_end] 区间里减去 busy_list（多个忙碌段），返回空闲段列表。
+    输入输出都是 (start_dt, end_dt) 元组。"""
+    free = [(window_start, window_end)]
+    for bs, be in busy_list:
+        # be >= window_start 且 bs <= window_end 才有交集
+        if be <= window_start or bs >= window_end:
+            continue
+        new_free = []
+        for fs, fe in free:
+            # 拆分：[fs,fe] 减去 [bs,be]
+            if be <= fs or bs >= fe:
+                new_free.append((fs, fe))  # 无交集
+            else:
+                if bs > fs:
+                    new_free.append((fs, min(bs, fe)))
+                if be < fe:
+                    new_free.append((max(be, fs), fe))
+        free = new_free
+    return free
+
+
+def get_freebusy_blocks(oids, start_iso, end_iso, labels=None):
     """
-    调 +suggestion 拿多面试官的共同空闲块。
-    返回 [{"start": datetime, "end": datetime, "reason": str}, ...]，只保留"完全空闲"的。
+    用 freebusy 拿每个人真实忙碌，反推空闲段，多人取交集。
+    返回 (blocks, busy_by_date)：
+      - blocks: [{"start","end","reason","fully_free":True}] 反推空闲段（已扣除午休）
+      - busy_by_date: {date: [(start_dt, end_dt, who_or_reason), ...]} 真实会议段
+                      （只含 freebusy 返回的会议，不含午休；午休单独标"午休"）
+
+    注意：suggestion 接口只返回飞书"挑出来的建议"不是完整空闲列表（实测漏报严重：
+    人越空漏得越多，曾导致全天空闲的人显示为"无空档"）。所以用 freebusy 反推。
     """
-    attendee_ids = ",".join(oids)
-    # 构造排除项：每天午休 12:00-13:30
-    start_dt = datetime.datetime.fromisoformat(start_iso.replace("+08:00", "+08:00"))
-    end_dt = datetime.datetime.fromisoformat(end_iso.replace("+08:00", "+08:00"))
-    excludes = []
-    cur = start_dt.date()
-    while cur <= end_dt.date():
-        excludes.append(f"{cur}T12:00:00+08:00~{cur}T13:30:00+08:00")
+    window_start = _parse_iso(start_iso)
+    window_end = _parse_iso(end_iso)
+
+    # 构造午休忙碌段（每天 12:00-13:30，作为"必须排除"加入 busy）
+    lunch_busy = []
+    cur = window_start.date()
+    while cur <= window_end.date():
+        lunch_busy.append((
+            datetime.datetime(cur.year, cur.month, cur.day, 12, 0, tzinfo=TZ),
+            datetime.datetime(cur.year, cur.month, cur.day, 13, 30, tzinfo=TZ),
+        ))
         cur += datetime.timedelta(days=1)
-    exclude_str = ",".join(excludes)
 
-    args = [
-        "calendar", "+suggestion",
-        "--start", start_iso,
-        "--end", end_iso,
-        "--attendee-ids", attendee_ids,
-        "--duration-minutes", "60",
-        "--exclude", exclude_str,
-        "--format", "json",
-    ]
-    print(f"[查询中] 调用 suggestion 查 {len(oids)} 位面试官共同空闲，范围 {start_iso} ~ {end_iso}")
-    data = run_lark(args)
+    labels = labels or [str(i) for i in range(len(oids))]
+    print(f"[查询中] 调用 freebusy 查 {len(oids)} 位面试官真实忙碌，范围 {start_iso} ~ {end_iso}")
 
-    suggestions = data.get("data", {}).get("suggestions", [])
+    # 每个人反推空闲，存每人的空闲段集合；同时收集真实忙碌段（带姓名归属）
+    per_person_free = []
+    real_busy = []  # [(start, end, who_label)] 真实会议，不含午休
+    for oid, label in zip(oids, labels):
+        data = run_lark([
+            "calendar", "+freebusy",
+            "--user-id", oid,
+            "--start", start_iso,
+            "--end", end_iso,
+            "--format", "json",
+        ])
+        # freebusy 返回平铺数组（非 data 下），兼容两种结构
+        items = data.get("data", [])
+        if items is None:
+            items = []
+        if isinstance(items, dict):
+            items = items.get("items", []) or items.get("freebusy_list", [])
+        # 区分"面试官真没会" vs "API 失败返空（token 过期/open_id 失效）"
+        if not data.get("ok", True) and not items:
+            print(f"  [⚠️ 空结果可能异常] {label}({oid[:12]}...) freebusy 返回空且 ok=false——"
+                  f"可能是 token 过期或 open_id 失效，反推出的'全空闲'不一定真实。建议核对飞书日历。")
+        busy = []
+        for it in items:
+            bs = _parse_iso(it["start_time"])
+            be = _parse_iso(it["end_time"])
+            busy.append((bs, be))
+            real_busy.append((bs, be, label))
+        busy.extend(lunch_busy)  # 午休当忙碌排除（但只在反推用，不进 real_busy）
+        free = _subtract_busy(window_start, window_end, busy)
+        per_person_free.append(free)
+        print(f"  {label}({oid[:12]}...) 忙碌 {len(items)} 段，反推空闲 {len(free)} 段")
+
+    # 多人取交集（单人直接用）
+    if len(per_person_free) == 1:
+        common_free = per_person_free[0]
+    else:
+        common_free = per_person_free[0]
+        for other in per_person_free[1:]:
+            merged = []
+            for (s1, e1) in common_free:
+                for (s2, e2) in other:
+                    s, e = max(s1, s2), min(e1, e2)
+                    if s < e:
+                        merged.append((s, e))
+            common_free = merged
+
     blocks = []
-    for s in suggestions:
-        reason = s.get("recommend_reason", "")
-        start = datetime.datetime.fromisoformat(s["event_start_time"])
-        end = datetime.datetime.fromisoformat(s["event_end_time"])
-        blocks.append({"start": start, "end": end, "reason": reason, "fully_free": "完全空闲" in reason})
-    return blocks
+    for s, e in common_free:
+        # 跨天的空闲段按自然天拆分（避免显示 "15:30-11:00" 这种倒序段）
+        day = s.date()
+        while day <= e.date():
+            day_start = datetime.datetime(day.year, day.month, day.day, 0, 0, tzinfo=TZ)
+            day_end = day_start + datetime.timedelta(days=1)
+            seg_s, seg_e = max(s, day_start), min(e, day_end)
+            if seg_s < seg_e:
+                blocks.append({"start": seg_s, "end": seg_e, "reason": "freebusy反推空闲", "fully_free": True})
+            day += datetime.timedelta(days=1)
+
+    # 真实会议按天聚合（同一时段多人有会，合并归属）
+    busy_by_date = {}
+    for bs, be, who in real_busy:
+        busy_by_date.setdefault(bs.date(), []).append((bs, be, who))
+    return blocks, busy_by_date, lunch_busy
 
 
 def intersect(candidate_date, time_hint, blocks, duration_min, work_start=9, work_end=18):
@@ -244,10 +567,13 @@ def intersect(candidate_date, time_hint, blocks, duration_min, work_start=9, wor
         # 限定在候选人指定的那一天
         if b["start"].date() != candidate_date:
             continue
-        # suggestion 返回的空闲块本身就是飞书算好的可约时段，直接用其起止切档
-        # （不再用 work_start/work_end 二次截断——晚上面试也是有效的）
-        slot_start = b["start"]
-        slot_end = b["end"]
+        # freebusy 反推的空闲段是全天，必须按工作时间截断
+        # 默认 09:00-18:00（晚上面试有效时用户传 --work-end 21 等）
+        day = candidate_date
+        win_start = datetime.datetime(day.year, day.month, day.day, work_start, 0, tzinfo=TZ)
+        win_end = datetime.datetime(day.year, day.month, day.day, work_end, 0, tzinfo=TZ)
+        slot_start = max(b["start"], win_start)
+        slot_end = min(b["end"], win_end)
         if slot_end <= slot_start:
             continue
         # 切档（每 30 分钟一档，找够 duration_min 的）
@@ -287,20 +613,193 @@ def _has_conflict(date, time_str, duration_min, occupied):
     return False
 
 
+def _slot_priority(time_str):
+    """面试时间优先级评分（越小越优先）。面试黄金时段：11:00、15:00-18:00。
+    09:00 过早、12:00-13:00 午休前后、18:00+ 偏晚都靠后。"""
+    h, m = int(time_str[:2]), int(time_str[3:5])
+    minutes = h * 60 + m
+    # 偏好锚点：11:00(660)、15:00(900)、16:00(960)、17:00(1020) 取最近距离
+    anchors = [660, 900, 960, 1020]
+    return min(abs(minutes - a) for a in anchors)
+
+
+def best_slot(avail, time_hint=None):
+    """从可选时段里挑最佳。
+    - time_hint 是精确时刻（HH:MM）→ 优先选离该时刻最近的（尊重候选人明确给的时间点）
+    - 否则 → 面试黄金时段优先（11点/下午3-6点）
+    """
+    if not avail:
+        return None
+    if time_hint and ":" in time_hint:
+        target_h, target_m = [int(x) for x in time_hint.split(":")]
+        target_minutes = target_h * 60 + target_m
+        return min(avail, key=lambda s: abs(int(s[:2]) * 60 + int(s[3:5]) - target_minutes))
+    return min(avail, key=_slot_priority)
+
+
+def time_cn(time_str):
+    """'HH:MM' → 中文时间习惯：'上午11点' / '下午4点' / '下午3点半'。
+    12点前=上午，12-18=下午，18+=晚上。整点不带'分'，半点用'半'。"""
+    h, m = int(time_str[:2]), int(time_str[3:5])
+    if h < 12:
+        period = "上午"
+        h12 = h
+    elif h < 18:
+        period = "下午"
+        h12 = h - 12 if h > 12 else 12
+    else:
+        period = "晚上"
+        h12 = h - 12
+    if m == 0:
+        return f"{period}{h12}点"
+    elif m == 30:
+        return f"{period}{h12}点半"
+    else:
+        return f"{period}{h12}点{m:02d}分"
+
+
 def weekday_cn(d):
     return "周" + "一二三四五六日"[d.weekday()]
 
 
+_ROOMS_CACHE = None  # 进程内缓存全量会议室列表（vc/v1/rooms 枚举结果）
+
+
+def list_all_rooms(force_refresh=False):
+    """枚举企业全量会议室（vc/v1/rooms，tenant token）。
+    ⚠️ room-find 只返回推荐子集（实测全天仅 6/7 间、单时段漏 5 间），不可靠；
+    正确做法 = 枚举全量 + 逐间查忙闲。需要应用已申请 vc:room（或 readonly）权限。
+    返回 [{room_id, name, capacity}, ...]；失败返回 []。
+    """
+    global _ROOMS_CACHE
+    if _ROOMS_CACHE is not None and not force_refresh:
+        return _ROOMS_CACHE
+    try:
+
+
+        rooms = []
+        page_token = ""
+        while True:
+            params = {"page_size": 100}
+            if page_token:
+                params["page_token"] = page_token
+            d = api("GET", "/open-apis/vc/v1/rooms", params=params)
+            data = d.get("data", {}) or {}
+            for rm in data.get("rooms", []) or []:
+                rooms.append({
+                    "room_id": rm.get("room_id", ""),
+                    "room_name": rm.get("name", ""),
+                    "capacity": rm.get("capacity", 0),
+                })
+            if data.get("has_more"):
+                page_token = data.get("page_token", "")
+            else:
+                break
+        _ROOMS_CACHE = rooms
+        print(f"[会议室] 枚举全量 {len(rooms)} 间")
+        return rooms
+    except Exception as e:
+        print(f"[⚠️ 枚举会议室异常] {e}")
+        return []
+
+
+def room_busy(start_iso, end_iso, room_id, tok):
+    """查单间会议室忙闲（calendar/v4/freebusy/list，room_id 参数）。
+    返回 True=忙（有占用），False=空闲。
+    """
+    try:
+        d = api("POST", "/open-apis/calendar/v4/freebusy/list",
+                data={"time_min": start_iso, "time_max": end_iso, "room_id": room_id})
+        busy = (d.get("data") or {}).get("freebusy_list", []) or []
+        return len(busy) > 0
+    except Exception:
+        return False
+
+
+def find_rooms(start_iso, end_iso, min_capacity=0, room_name="", building="", floor="", as_user=True):
+    """查指定时间段可用的会议室（视频/现场面试的场地硬约束）。
+    **升级版（2026-08-03）**：弃用 room-find 推荐子集，改为：
+      ① vc/v1/rooms 枚举全量会议室（进程内缓存）
+      ② calendar/v4/freebusy/list 逐间查忙闲（room_id 参数）
+      ③ 空闲 ∩ 容量/名称/楼栋筛选 → 全部返回（不再只给推荐 3 间）
+    返回 (ok, rooms, hint)：
+      ok    = 是否有可用会议室
+      rooms = [{room_id, room_name, capacity}, ...]（全部可用，最多展示前 5）
+      hint  = 无可用时的原因
+    """
+    all_rooms = list_all_rooms()
+    if not all_rooms:
+        # 枚举失败（权限未开）→ 回退 room-find 推荐，并明确提示
+        print("[⚠️ 回退] 全量枚举不可用，改用 room-find 推荐子集（结果可能不全）")
+        args = ["calendar", "+room-find", "--as", "user" if as_user else "bot",
+                "--slot", f"{start_iso}~{end_iso}", "--format", "json"]
+        if min_capacity and min_capacity > 0:
+            args += ["--min-capacity", str(min_capacity)]
+        if room_name:
+            args += ["--room-name", room_name]
+        if building:
+            args += ["--building", building]
+        if floor:
+            args += ["--floor", floor]
+        data = run_lark(args)
+        try:
+            slots = (data.get("data") or {}).get("time_slots", []) or []
+            if not slots:
+                return False, [], "无返回"
+            ts = slots[0]
+            rooms = ts.get("meeting_rooms", []) or []
+            hint = ts.get("hint", "")
+            return (len(rooms) > 0), rooms[:3], hint
+        except Exception as e:
+            return False, [], f"解析失败: {e}"
+
+    # 主路径：全量枚举 + 逐间查忙闲
+
+    avail = []
+    for rm in all_rooms:
+        # 容量筛选
+        if min_capacity and min_capacity > 0 and (rm.get("capacity") or 0) < min_capacity:
+            continue
+        # 名称筛选
+        if room_name and room_name not in (rm.get("room_name") or ""):
+            continue
+        # 楼栋/楼层筛选（room_name 形如"恒昌大厦西座7楼-迷你玩-A区-星灵"）
+        if building and building not in (rm.get("room_name") or ""):
+            continue
+        if floor and floor not in (rm.get("room_name") or ""):
+            continue
+        if room_busy(start_iso, end_iso, rm["room_id"]):
+            continue  # 该时段忙，跳过
+        avail.append(rm)
+
+    if avail:
+        return True, avail, ""  # 全量返回（不再截断——草稿要如实展示所有可用会议室，2026-08-04 修：曾截到 5 间再截 2 间，草稿永远只显示前两间）
+    return False, [], "该时段全量会议室均被占用"
+
+
 def main():
-    ap = argparse.ArgumentParser(description="面试时间协调")
+    ap = argparse.ArgumentParser(description="面试时间协调（吃 ATS 出完整草稿）")
     ap.add_argument("--interviewer", required=True, help="面试官姓名，逗号分隔（如 谢坤,潘腾飞）")
     ap.add_argument("--candidates", required=True, help='候选人及时间，逗号分隔（如 "罗艺=周四,陈思宇=周四 16:00"）')
-    ap.add_argument("--duration", type=int, default=60, help="面试时长（分钟），默认 60")
+    ap.add_argument("--talent-ids", default="", help="候选人 talent_id，逗号分隔，与 --candidates 顺序对齐（可选，用于精确匹配 ATS）")
+    ap.add_argument("--form", default="视频", choices=["视频", "线下", "现场"], help="面试形式，默认 视频（'现场'已废弃→自动归一化为'线下'，保留仅为兼容旧用法）")
+    ap.add_argument("--team", default="", help="团队名覆盖（草稿标题用，默认取 ATS dept）")
+    ap.add_argument("--ats-file", default=ATS_FILE, help=f"ATS 数据源 JSON 路径（默认 {ATS_FILE}）")
+    ap.add_argument("--duration", type=int, default=45, help="面试时长（分钟），默认 45（2026-08-04 用户定稿；需要 60 分钟显式传）")
     ap.add_argument("--days", type=int, default=7, help="查询未来几天，默认 7")
+    ap.add_argument("--max-per-day", type=int, default=0, help="每天最多安排几场面试（0=不限，如 2 表示每天≤2 场——2026-08-04 用户'别排太密'偏好落地）")
+    ap.add_argument("--min-capacity", type=int, default=0, help="会议室最小容量（默认 0=不限制）")
+    ap.add_argument("--no-room", action="store_true", help="不校验会议室（默认所有形式都查——视频面试面试官也需要会议室）")
+    ap.add_argument("--room-name", default="", help="会议室名称约束（如 01,02，可选）")
+    ap.add_argument("--building", default="", help="会议室楼栋约束（可选）")
+    ap.add_argument("--floor", default="", help="会议室楼层约束，如 F7（可选）")
     ap.add_argument("--work-start", default="9", help="工作开始小时，默认 9")
     ap.add_argument("--work-end", default="18", help="工作结束小时，默认 18")
     ap.add_argument("--dry-run", action="store_true", help="只解析不查飞书")
     args = ap.parse_args()
+    # 归一化：'现场' → '线下'（2026-08-04 用户定稿：'线下面试'更贴切，'现场'保留仅为兼容旧用法）
+    if args.form == "现场":
+        args.form = "线下"
 
     today = datetime.date.today()
     work_start = int(args.work_start.split(":")[0])
@@ -313,21 +812,53 @@ def main():
         print("[❌ 没有有效的面试官，终止]")
         return
 
-    # ② 解析候选人时间
+    # ② 解析候选人时间 + 匹配 ATS
+    # 支持格式：姓名=时间   或   姓名=时间@岗位方向（@后是岗位简称，用于草稿展示）
+    talent_ids = [t.strip() for t in args.talent_ids.split(",") if t.strip()] if args.talent_ids else []
+    by_tid, by_name = load_ats_data(args.ats_file)
+    if by_tid:
+        print(f"[ATS] 加载 {len(by_tid)} 条候选人记录（{args.ats_file}）")
+    else:
+        print(f"[ATS] 无数据或读取失败（{args.ats_file}），草稿岗位/进展将标【需问用户】")
+
     candidates = []
-    for pair in args.candidates.split(","):
+    for idx, pair in enumerate(args.candidates.split(",")):
         if "=" not in pair:
-            print(f"[⚠️ 跳过] 候选人格式错误（需 姓名=时间）: {pair}")
+            print(f"[⚠️ 跳过] 候选人格式错误（需 姓名=时间 或 姓名=时间@岗位）: {pair}")
             continue
         name, raw_time = pair.split("=", 1)
-        dates, time_hint = parse_candidate_time(raw_time.strip(), today)
-        candidates.append({"name": name.strip(), "dates": dates, "time_hint": time_hint, "raw": raw_time.strip()})
+        name = name.strip()
+        # 拆出 @岗位方向（可选，草稿展示用）
+        role = ""
+        if "@" in raw_time:
+            raw_time, role = raw_time.rsplit("@", 1)
+            role = role.strip()
+        raw_time = raw_time.strip()
+        dates, time_hint = parse_candidate_time(raw_time, today)
+        # 周末告警（不强制排除，业务上偶尔有周末面试）：让用户看到"这是周末"再决定
+        for d in dates:
+            if d.weekday() >= 5:  # 5=周六, 6=周日
+                wd_cn = "周六" if d.weekday() == 5 else "周日"
+                print(f"[⚠️ 周末] {name} 给的 {d.isoformat()} 是{wd_cn}，公司通常不上班——草稿若生成周末时段请人工确认")
+        # 匹配 ATS（优先 talent_id，回退姓名）
+        tid = talent_ids[idx] if idx < len(talent_ids) else ""
+        ats = match_ats(name, tid, by_tid, by_name)
+        candidates.append({
+            "name": name, "dates": dates, "time_hint": time_hint, "raw": raw_time,
+            "role": role,  # @后的岗位方向（草稿展示用，可选）
+            "talent_id": tid, "ats": ats,
+        })
 
     if args.dry_run:
         print("\n=== [dry-run] 解析结果 ===")
         print(f"面试官: {labels}")
+        print(f"形式: {args.form}")
         for c in candidates:
-            print(f"  {c['name']}: 日期={[weekday_cn(d)+str(d) for d in c['dates']]}, 时段偏好={c['time_hint']}")
+            role_tag = f" [{c['role']}]" if c["role"] else ""
+            ats = c.get("ats") or {}
+            ats_str = f" ATS={ats.get('job','?')}/{ats.get('stage','?')}/面{ats.get('interview_count','?')}" if ats else " ATS=【缺】"
+            tid_str = f" tid={c['talent_id']}" if c["talent_id"] else ""
+            print(f"  {c['name']}{role_tag}{tid_str}{ats_str}: 日期={[weekday_cn(d)+str(d) for d in c['dates']]}, 时段偏好={c['time_hint']}")
         return
 
     # ③ 查面试官共同空闲（覆盖所有候选人提到的日期 + 未来 N 天）
@@ -338,84 +869,280 @@ def main():
     if not all_dates:
         print("[❌ 没有有效的候选人日期，终止]")
         return
-    # suggestion 查询区间不能超过 7 天（飞书 API 限制，超了报 190014）
-    # 策略：以候选人最早日期为起点，最多查 7 天（确保覆盖所有候选人日期）
+    # freebusy 无 7 天限制（只有 suggestion 才报 190014，本项目已弃用 suggestion）。
+    # 查询区间 = earliest ~ earliest + args.days 天，覆盖 --days 参数。候选人日期超出此窗口会被截断告警。
     earliest = min(all_dates | {today})
     latest_candidate = max(all_dates)
-    latest = min(latest_candidate, earliest + datetime.timedelta(days=6))  # 7天区间=起止差6天
-    # 如果候选人日期跨度超过7天（罕见），分批查（这里先单批，超期则截断并告警）
-    if latest_candidate > earliest + datetime.timedelta(days=6):
-        print(f"[⚠️ 候选人日期跨度超过7天，本次只查 {earliest} ~ {latest}")
+    latest = min(latest_candidate, earliest + datetime.timedelta(days=args.days - 1))
+    if latest_candidate > earliest + datetime.timedelta(days=args.days - 1):
+        print(f"[⚠️ 候选人日期跨度超过 --days={args.days} 天，本次只查 {earliest} ~ {latest}，"
+              f"超期未查（{latest_candidate} 等）。可加大 --days 扩大窗口。")
     start_iso = f"{earliest}T{work_start:02d}:00:00+08:00"
     end_iso = f"{latest}T{work_end:02d}:00:00+08:00"
 
-    blocks = get_freebusy_blocks(oids, start_iso, end_iso)
+    blocks, busy_by_date, lunch_busy = get_freebusy_blocks(oids, start_iso, end_iso, labels)
     fully_free = [b for b in blocks if b["fully_free"]]
     print(f"[查询完成] 共 {len(blocks)} 个空闲块，其中 {len(fully_free)} 个完全空闲")
 
     # ④ 对每个候选人求交（同一面试官的时段不能重复分给多人）
     lines_result = []
-    lines_draft_candidates = []  # 用于草稿
+    # 按候选人聚合：{name: {raw, role, hits: [(wd, date_str, suggest, room_line), ...]}}
+    cand_matches = {}
+    c_time_hint = {c["name"]: c["time_hint"] for c in candidates}  # name -> 时段偏好（"下午"/"16:00"等）
     occupied = set()  # 已分配给前面候选人的 (date, time)，避免同一面试官撞档
+    per_day_count = {}  # date -> 已分配场数（--max-per-day 密度约束：用户"别排太密"偏好）
+    assigned_once = {}  # name -> bool：每候选人只算拟安排（首次分配）的日期计入密度；同名条目的兜底备选日期不算
     for c in candidates:
+        cand_matches.setdefault(c["name"], {"raw": c["raw"], "role": c.get("role", ""), "hits": []})
         for d in c["dates"]:
+            # 每天容量上限：该日期已满 → 跳过（候选人顺延到后续日期，草稿窗口仍完整展示可约日期）
+            if args.max_per_day and per_day_count.get(d, 0) >= args.max_per_day:
+                continue
             slots = intersect(d, c["time_hint"], blocks, args.duration, work_start, work_end)
             # 排除已被其他候选人占用的时段（按 30 分钟对齐，duration 内不能重叠）
             avail = [s for s in slots if not _has_conflict(d, s, args.duration, occupied)]
             wd = weekday_cn(d)
             date_str = f"{d.month}-{d.day}"
             if avail:
-                # 建议策略：无偏好取最早的（让面试官先面完），有偏好取符合偏好的最早
-                suggest = avail[0]
+                # 建议策略：候选人有精确时刻→贴他给的时间点；否则→面试黄金时段（11点/下午3-6点）
+                suggest = best_slot(avail, c["time_hint"])
+                room_line = ""
+                if not args.no_room:
+                    # 会议室是面试官侧的场地硬约束：视频面试面试官也在公司会议室里，同样要订会议室。
+                    # 黄金时段没会议室 → 顺延找有会议室的时段。--no-room 可关闭（纯远程/不需要会议室时）。
+                    # ⚠️ suggest 是 best_slot 结果（已含候选人精确时刻偏好/黄金时段），必须放最前先查会议室——
+                    #    否则按黄金时段重排会把候选人的精确偏好（如 10:00/14:00）挤到队尾，
+                    #    会议室顺延循环先命中 17:00 就停，偏好时段被跳过（2026-08-04 修：传 8-6 10:00 却建议 17:00）。
+                    ordered = [suggest] + sorted((s for s in avail if s != suggest), key=_slot_priority)
+                    chosen = None
+                    for s in ordered:
+                        h, m = int(s[:2]), int(s[3:5])
+                        s_dt = datetime.datetime(d.year, d.month, d.day, h, m, tzinfo=TZ)
+                        e_dt = s_dt + datetime.timedelta(minutes=args.duration)
+                        ok, rooms, hint = find_rooms(
+                            s_dt.isoformat(), e_dt.isoformat(),
+                            args.min_capacity, args.room_name, args.building, args.floor,
+                        )
+                        if ok:
+                            chosen = s
+                            # 会议室是"校验器"不是"展示器"：成功时草稿不输出任何会议室信息
+                            # （2026-08-04 用户定稿：只在无可用会议室时才告警提醒换时段，有会议室就别提）
+                            room_line = ""
+                            break
+                    if chosen is None:
+                        # 所有可约时段都没会议室 → 该日期整体标记，建议换日期
+                        lines_result.append(
+                            f"  {c['name']:<6} {wd}({date_str}) → ❌ 面试官有空但全时段无可用会议室（{c['raw']}），需换日期"
+                        )
+                        continue
+                    if chosen != suggest:
+                        suggest = chosen
                 occupied.add((d, suggest))
-                # 展示用原始 slots（让用户看到全部可选项），标注建议
-                show = avail if len(avail) <= 6 else avail[:6]
-                lines_result.append(f"  {c['name']:<6} {wd}({date_str}) → ✅ 可约 {'/'.join(show)}（建议 {suggest}）")
-                lines_draft_candidates.append((c["name"], wd, date_str, suggest))
+                # 密度计数：每候选人只在"拟安排（首次分配）"的日期计 1 场，兜底备选日期不计
+                if not assigned_once.get(c["name"]):
+                    assigned_once[c["name"]] = True
+                    per_day_count[d] = per_day_count.get(d, 0) + 1
+                # 展示按时段优先级排序（黄金时段靠前），最多6个
+                avail_sorted = sorted(avail, key=_slot_priority)
+                show = avail_sorted if len(avail_sorted) <= 6 else avail_sorted[:6]
+                room_tag = f" 会议室✅" if room_line else ""
+                lines_result.append(f"  {c['name']:<6} {wd}({date_str}) → ✅ 可约 {'/'.join(show)}（建议 {suggest}）{room_tag}")
+                cand_matches[c["name"]]["hits"].append((wd, date_str, suggest, room_line))
             else:
                 lines_result.append(f"  {c['name']:<6} {wd}({date_str}) → ❌ 该时段面试官无空档或已被其他候选人占用（{c['raw']}）")
 
     # ⑤ 生成草稿
-    # 面试官称谓：缓存里 alias[0] 或姓名
-    cache = load_cache()
-    iv_label = labels[0]  # 多面试官取第一个的称谓（通常主面）
-    # 从缓存拿 alias
+    # 守卫：会议室校验开启时全部被卡死 → 不出草稿，明确提示换日期
+    matched = [n for n, m in cand_matches.items() if m["hits"]]
+    if not matched:
+        out = []
+        out.append("=== 协调结果 ===")
+        out.append(f"面试官：{'、'.join(labels)}（{args.form}面试）")
+        out.append("")
+        out.append("【候选人匹配】")
+        out.extend(lines_result)
+        out.append("")
+        out.append("=== ⚠️ 无可用安排：所有候选人的可约时段均无可用会议室，需与候选人重新协调日期（或 --no-room 跳过会议室校验） ===")
+        print("\n" + "\n".join(out))
+        print(f"\n[✅ 完成]（无草稿产出——会议室硬约束未满足）")
+        return
+
+    # ⑤ 生成完整草稿（吃 ATS，五要素齐全）
+    name_to_ats = {c["name"]: c.get("ats") for c in candidates}
+
+    header = build_header(
+        [name_to_ats.get(n) for n in matched],
+        args.form, args.team,
+    )
+    header_line = header or f"【需问用户：团队+岗位】{args.form}面试"
+
+    # 面试官称谓：缓存里 alias[0] 或姓名（草稿抬头用，alias 如 Sava=古振兴）
     iv_alias = ""
-    for oid, info in cache.items():
+    for oid, info in load_cache().items():
         if info.get("name") == interviewer_names[0] and info.get("alias"):
             iv_alias = info["alias"][0]
             break
     salutation = iv_alias or interviewer_names[0]
 
-    if len(lines_draft_candidates) == 1:
-        # 单人单时段：用你案例2的话术风格
-        name, wd, ds, t = lines_draft_candidates[0]
-        draft = f"{salutation}，这个候选人我沟通了一下，安排在 {wd}（{ds}）{t} 面试🆗吗"
-    else:
-        # 多人：用你案例1的话术风格
-        body = "\n".join([f"{name}：\n{wd}：{t}" if False else f"{name} {wd} {t}" for name, wd, ds, t in lines_draft_candidates])
-        draft = f"{salutation}，我和候选人沟通了一下，安排如下你看🆗不：\n{body}"
+    def _candidate_block(name, role_hint, raw, hits, ats, form_cn):
+        """单人块（多日期聚合版）：
+        姓名（岗位·轮次）：
+        面试可以时间：8/4（周二）全天、8/5（周三）   ← 完整可约窗口 + 时段偏好
+        拟安排：8/4（周二）下午4点（视频），会议室：XX  ← 最优时段 + 形式 + 会议室
+        hits: [(wd, date_str, suggest, room_line), ...] 按优先级排序，第一个是最优
+        """
+        ats = ats or {}
+        progress, round_role = progress_text(
+            ats.get("stage"), ats.get("interview_count"), ats.get("latest_conclusion"),
+        )
+        # 括号内容：岗位·轮次（岗位从 ATS 取，轮次从 ATS 推；ATS 缺时用 role_hint 兜底）
+        job = ats.get("job", "")
+        role_tag = round_role or role_hint
+        if job and role_tag:
+            paren = f"{job}·{role_tag}"
+        elif job:
+            paren = job
+        elif role_tag:
+            paren = role_tag
+        else:
+            paren = ""
+        head = f"{name}（{paren}）：" if paren else f"{name}："
+        # 完整可约窗口：所有命中日期的绝对日期（去重保序），带时段偏好
+        time_pref = c_time_hint.get(name, "")
+        date_parts = []
+        for wd, ds, t, room_line in hits:
+            d_str = ds.replace("-", "/") + "（" + wd + "）"
+            date_parts.append(d_str)
+        window = "、".join(dict.fromkeys(date_parts))
+        if time_pref:
+            window = f"{window}（{time_pref}）"
+        elif len(hits) == 1:
+            # 单个日期且候选人没说时段 → 标"全天"（方便面试官知道窗口是整天）
+            window = f"{window}全天"
+        # 拟安排：第一个命中（优先级最高），标形式（视频/现场）
+        wd0, ds0, t0, room_line0 = hits[0]
+        abs_suggest = ds0.replace("-", "/") + "（" + wd0 + "）" + time_cn(t0) + f"（{form_cn}）" + room_line0
+        return f"{head}\n面试可以时间：{window}\n拟安排：{abs_suggest}"
 
-    # ⑥ 输出写文件（避免 GBK 乱码）
+    def _summary_phrase(names, name_to_ats):
+        """从匹配成功的候选人列表提炼'是谁、推进几面'的概述。
+        同轮次合并：'蒋新斌、林盛烁推进三面'；轮次不同分开：'A推进复试，B推进三面'。
+        ATS 缺失标【需问用户】。
+        """
+        segs = []  # [(轮次, [姓名])]
+        for name in names:
+            ats = name_to_ats.get(name) or {}
+            _, round_role = progress_text(
+                ats.get("stage"), ats.get("interview_count"), ats.get("latest_conclusion"),
+            )
+            role = round_role or "【需问用户：轮次】"
+            # 合并同轮次
+            if segs and segs[-1][0] == role:
+                segs[-1][1].append(name)
+            else:
+                segs.append((role, [name]))
+        parts = []
+        for role, names_grp in segs:
+            parts.append(f"{'、'.join(names_grp)}推进{role}")
+        return "，".join(parts)
+
+    if len(matched) == 1:
+        name = matched[0]
+        m = cand_matches[name]
+        ats = name_to_ats.get(name)
+        progress, _ = progress_text(
+            (ats or {}).get("stage"), (ats or {}).get("interview_count"), (ats or {}).get("latest_conclusion"),
+        )
+        form_cn = "视频" if args.form == "视频" else "线下"
+        block = _candidate_block(name, m["role"], m["raw"], m["hits"], ats, form_cn)
+        need_user = ""
+        if not ats or not progress:
+            need_user = "\n【需问用户：上轮进展+这轮角色】"
+        summary = _summary_phrase(matched, name_to_ats)
+        job_brief = _job_brief([name_to_ats.get(n) for n in matched], args.team) or header_line
+        # 会议室信息不展示在草稿尾部（2026-08-04 用户定稿：有会议室就别提，只在无可用时另行告警）
+        room_tail = ""
+        draft = (
+            f"{salutation}，{job_brief}，{summary}，我和候选人沟通了一下面试时间：\n\n"
+            f"{block}{need_user}\n\n"
+            f"看看这个{form_cn}面试时间可以的话我去敲定{room_tail}。"
+        )
+    else:
+        # 多人：称谓 → 这是谁/推进几面 → 我沟通了时间 → 具体安排
+        blocks = []
+        form_cn = "视频" if args.form == "视频" else "线下"
+        for name in matched:
+            m = cand_matches[name]
+            blocks.append(_candidate_block(name, m["role"], m["raw"], m["hits"], name_to_ats.get(name), form_cn))
+        body = "\n\n".join(blocks)
+        summary = _summary_phrase(matched, name_to_ats)
+        job_brief = _job_brief([name_to_ats.get(n) for n in matched], args.team) or header_line
+        # 会议室信息不展示在草稿尾部（2026-08-04 用户定稿：有会议室就别提，只在无可用时另行告警）
+        room_tail = ""
+        draft = (
+            f"{salutation}，{job_brief}，{summary}，我和候选人沟通了一下面试时间：\n\n"
+            f"{body}\n\n"
+            f"这几个{form_cn}面试时间都避开了你日程上的会议{room_tail}，看看可以的话我去敲定。"
+        )
+
+    # ⑥ stdout 直出（删 _schedule_match.txt——git-bash UTF-8 不乱码，AGENTS.md 已确认）
     out = []
-    out.append("=== 匹配结果 ===")
-    out.append(f"面试官：{ '、'.join(labels) }")
-    # 面试官空闲摘要
+    out.append("=== 面试官日程（freebusy 实查）===")
+    out.append(f"面试官：{'、'.join(labels)}")
+    out.append(f"形式：{args.form}｜查询区间：{earliest.month}-{earliest.day} ~ {latest.month}-{latest.day}｜工作时段 {work_start:02d}:00-{work_end:02d}:00｜每天 12:00-13:30 午休已排除")
+    out.append("")
+
+    # —— 忙碌时间段
+    out.append("【忙碌时间段】（真实会议）")
+    all_dates_in_range = sorted(set(list(busy_by_date.keys()) + [b["start"].date() for b in fully_free]))
+    multi = len(oids) > 1
+    for d in all_dates_in_range:
+        segs = sorted(busy_by_date.get(d, []), key=lambda x: x[0])
+        if segs:
+            if multi:
+                parts = [f"{s.strftime('%H:%M')}-{e.strftime('%H:%M')}({who})" for s, e, who in segs]
+            else:
+                parts = [f"{s.strftime('%H:%M')}-{e.strftime('%H:%M')}" for s, e, who in segs]
+            out.append(f"  {weekday_cn(d)}({d.month}-{d.day}): {', '.join(parts)}")
+        else:
+            out.append(f"  {weekday_cn(d)}({d.month}-{d.day}): 无会议")
+    out.append("")
+
+    # —— 空闲时间段
+    out.append("【空闲时间段】（反推空闲 ∩ 工作时段，已扣上述会议和午休）")
     free_by_date = {}
     for b in fully_free:
-        k = b["start"].date()
-        free_by_date.setdefault(k, []).append(b)
-    for d in sorted(free_by_date.keys()):
-        slots_d = free_by_date[d]
+        free_by_date.setdefault(b["start"].date(), []).append(b)
+    for d in all_dates_in_range:
         ranges = []
-        for b in slots_d:
-            ranges.append(f"{b['start'].strftime('%H:%M')}-{b['end'].strftime('%H:%M')}")
-        out.append(f"  {weekday_cn(d)}({d.month}-{d.day}) 空闲: {', '.join(ranges)}")
+        win_s = datetime.datetime(d.year, d.month, d.day, work_start, 0, tzinfo=TZ)
+        win_e = datetime.datetime(d.year, d.month, d.day, work_end, 0, tzinfo=TZ)
+        for b in free_by_date.get(d, []):
+            s, e = max(b["start"], win_s), min(b["end"], win_e)
+            if s < e:
+                ranges.append(f"{s.strftime('%H:%M')}-{e.strftime('%H:%M')}")
+        out.append(f"  {weekday_cn(d)}({d.month}-{d.day}): {', '.join(ranges) if ranges else '无空闲档'}")
     out.append("")
-    out.append("候选人可约时段：")
+
+    # —— ATS 数据匹配（新增段）
+    out.append("【ATS 数据匹配】（_daily_review.json 的 structured.ats）")
+    for c in candidates:
+        ats = c.get("ats") or {}
+        if ats:
+            tid = c.get("talent_id") or ats.get("talent_id", "?")
+            out.append(f"  ✅ {c['name']} (tid={tid[:12]}...): 岗位={ats.get('job','?')} 团队={ats.get('dept','?')} 阶段={ats.get('stage','?')} 已面{ats.get('interview_count','?')}轮 上轮结论={ats.get('latest_conclusion')}")
+        else:
+            out.append(f"  ❌ {c['name']}: ATS 未匹配（{'talent_id=' + c.get('talent_id','?') + ' 不在 ATS' if c.get('talent_id') else '未传 talent_id 且姓名无匹配/同名歧义'}）→ 草稿该候选人岗位/进展标【需问用户】")
+    out.append("")
+
+    # —— 候选人匹配
+    out.append("【候选人匹配】（空闲 ∩ 候选人日期，黄金时段优先）")
     out.extend(lines_result)
     out.append("")
-    out.append("=== 可转发草稿（发给面试官）===")
+    out.append("  选择规则：11:00、15:00-18:00 黄金时段优先；避开 09:00 过早 / 12:00-13:30 午休 / 18:00+ 偏晚；同一面试官多候选人自动防撞档。")
+    out.append("")
+
+    out.append("=== 可转发草稿（完整版，AI 只在【需问用户】处介入）===")
     out.append(draft)
     out.append("")
     out.append("=== 不可约的（如有，需重新和候选人协调）===")
@@ -423,11 +1150,8 @@ def main():
     out.extend(no_go if no_go else ["（无）"])
 
     text = "\n".join(out)
-    os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
-    with open(OUTPUT, "w", encoding="utf-8") as f:
-        f.write(text)
-    print(f"\n[✅ 完成] 结果已写入 {OUTPUT}")
     print("\n" + text)
+    print(f"\n[✅ 完成]（stdout 直出，不再写文件）")
 
 
 if __name__ == "__main__":

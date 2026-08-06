@@ -5,187 +5,223 @@ description: >
   触发词：收简历、整理简历、处理简历、下载简历、分类简历。
   只要用户提到简历、邮箱、候选人、作品集、归档，就使用这个skill。
   覆盖：标准附件下载、链接类附件（QQ超大附件/云盘）、美术岗作品集打包、多附件合并。
-  不覆盖：Bitable写入（按需执行）、BOSS直聘打招呼（见boss-recruit skill）。
-  依赖：lark-cli（mail 域已授权，权限已存本地，不查 auth）、Playwright MCP（链接类附件下载，CDP Proxy 做补充）。
+  不覆盖：Bitable写入（按需执行）、BOSS直聘打招呼（见boss-recruit skill）、**群聊文件简历**（见下方「群聊文件来源」）。
+  依赖：lark-cli（mail 域已授权，权限已存本地，不查 auth）、node v24+（跑 .mjs 脚本）、Python + PyMuPDF + python-docx（闸门/脱敏脚本）、Playwright MCP（链接类附件下载 fallback，主力是 batch_download_links.mjs）。
 ---
 
 # 简历收集与归档
+
+## 群聊文件来源（不归档，即用即录）
+
+业务方常在**飞书群/私聊**里直接发简历文件（不是邮件附件）。这类简历是**低频即用即下**场景（发一份、录一份），不走本 skill 的批量扫描归档管线，由 `_hire.py --by-name` 的**第三级级联**自动处理（本地归档库 → Downloads → 飞书群聊下载）：
+
+```bash
+python notes/_hire.py --by-name 白向庭 --job 海外游戏数据产品经理
+```
+
+`--by-name` 按优先级查找简历，前两级（归档库、Downloads）找不到时，自动从飞书群聊搜文件消息并下载到 Downloads，再走 Document AI 解析 + 录入。底层调 `_download_chat_file.py`（复用 lark-cli `im +messages-search` + `+messages-resources-download`）。详见 `recruit-followup` skill 的「录入候选人」。
 
 ## 配置
 
 | 项 | 值 |
 |---|---|
-| 归档根目录 | `F:/miniwanob/data/在招岗位候选人管理` |
-| 用户下载目录 | **`F:/Users/wuchunbo/Downloads`**（真实下载盘，不是 C 盘！USERPROFILE 是 C 盘但 Downloads 被重定向到 F 盘） |
-| lark-cli | `C:/Users/wuchunbo/AppData/Roaming/npm/lark-cli.cmd`，mail 域已授权，不查 auth |
-| node | 已装 v24，用于跑脚本（bash 在 cmd 不可用，统一用 node） |
+| 归档根目录 | `<PROJECT_ROOT>/data/在招岗位候选人管理` |
+| 用户下载目录 | **`F:/Users/wuchunbo/Downloads`**（F 盘，不是 C 盘） |
+| lark-cli | `LARK_CLI_PATH`，mail 域已授权 |
+| node | 已装 v24，用于跑脚本 |
+| **manifest 事实源** | **`<PROJECT_ROOT>/notes/collection_manifest.json`**（来源→候选人→岗位→目标路径→SHA-256 绑定） |
 
 ---
 
-## 阶段1：扫描（只读）
+## 安全管线流程（manifest 驱动）
 
-### 1. 拉取邮件 — 穷尽式，不要抽样
-
-**用现成脚本一次性翻完，不要手动 max 200 翻一页就以为扫完了：**
-
-```
-node "C:/Users/wuchunbo/.agents/skills/collect-resumes/scripts/scan_all.mjs"
-```
-
-> ⚠️ 脚本在 **skill 目录**下，不在项目根。项目根 `F:/miniwanob/scripts/` 不存在，写 `scripts/scan_all.mjs` 会报 `Cannot find module`。一律用上面这条绝对路径，在任何 CWD 下都对。
-
-脚本会分页直到 `has_more=false`（全量，不靠 subject 猜），排除通知关键词，把所有候选邮件列出来。输出存 `notes/_scan_all.json`。
-
-> 为什么用脚本：分页 + 排除 + 去重是机械活，每次手敲 max 值会漏。今天就是 max 200 翻一页就停，漏了候选人。
-
-筛选今天日期的邮件。排除关键词：员工关爱、面试邀约、日程提醒、系统通知、奋斗食代。
-
-BOSS 直聘邮件 subject 格式：`{姓名} | {经验}，应聘 {岗位} | {城市}{薪资}【BOSS直聘】`
-- 从 subject 提取姓名、工作年限、岗位名
-- 直投邮件（非 BOSS）subject 不规则，姓名和岗位需手动判断
-
-### 2. 逐封核查附件 + body 链接（每封都要查，不管附件数是几）
-
-**用现成脚本，不要手动一封封敲：**
+> **核心不变量**：每封相关邮件、每个附件和链接都有明确去向，不能静默消失；
+> 来源→候选人→岗位→目标路径不可拆分绑定；无法验证即阻断（fail-closed）。
 
 ```
-node "C:/Users/wuchunbo/.agents/skills/collect-resumes/scripts/verify_mails.mjs"
+阶段1 扫描（scan_all）     → 完整快照 _scan_all.json（原子发布）
+阶段2 核查（verify_mails）  → collection_manifest.json records
+阶段3 解析（resolve_records）→ 绑定候选人/岗位/目标路径
+阶段4 下载（download --record）→ .part → 校验 → 原子提交
+阶段5 合并（merge_results）  → manifest 状态推进到 archived
+阶段6 闸门（verify_archive） → 数量/姓名/薪酬/格式 + manifest 闭环 → validated
 ```
 
-脚本对每封邮件**一次** `mail +message` 同时取 `attachments`（标准附件）和 `body_html`（链接类附件），输出清单，并把附件 id 存到 `notes/_verified.json` 供 download 复用（省 N 次 +message）。
-
-> ⚠️ 铁律：**每封都查 body_html，不管 attachments 数量是几。**
-> 踩过的坑：卢苇那封 attachments=1（简历docx），就以为没作品了，结果作品是 QQ 超大附件，藏在 body_html 链接里。attachments 和 body 链接是**并存**的，不是二选一。
-
-链接类附件关键词：
-- `wx.mail.qq.com/ftn` → QQ超大附件
-- `mail.163.com/large` / `126.com` → 网易超大附件
-- `pan.baidu.com` / `aliyundrive` → 云盘
-- `作品` / `portfolio` / `artstation` → 作品集链接
-
-### 3. 岗位匹配 + 归档路径
-
-从 subject 提取岗位名，对照 `references/job-aliases.md` 找到文件夹名和团队路径。
-AI 直接判断，不写规则脚本。匹配不上 → 标"待确认"。
-
-### 4. 同一人多邮件合并
-
-按姓名去重，同一人的多封邮件合并为一行：
-- BOSS 简历 + 直投作品 → 合并
-- BOSS 简历 + QQ/163 作品集 → 合并
-- 展示时附件类型全部列出
-
-### 5. 对账本地
-
-```bash
-find <归档根目录> -name "*姓名*" -type f
-```
-
-### 6. 输出给用户确认
-
-**固定格式，按岗位分组：**
+### 阶段1：扫描（只读）
 
 ```
-【产品经理实习生】15 份
-  黎高岚 28届 BOSS 1PDF     [未归档]
-  李女士 27届 BOSS 1PDF     [未归档]
-  ...
-
-【特效设计师】2 人
-  陈伟龙 3年 BOSS+QQ 1PDF+作品rar(260MB)  [未归档]
-  刘莹 直投 163 作品zip(148MB)             [待确认岗位]
-
-【AI Native游戏服务端】2 份
-  钟明羿 5年 BOSS 1PDF  [未归档]
-  梁梓健 8年 BOSS 1PDF  [未归档]
+node "…/collect-resumes/scripts/scan_all.mjs"
 ```
 
-每行：`姓名 | 工作年限/届 | 来源 | 附件情况 | 状态`
+- **全量穷尽分页**（无 `--date` 参数，脚本不解析它；日期过滤在阶段2 `verify_mails --date` 做）。
 
----
+- 穷尽分页到 `has_more=false`，按 `message_id` 去重。
+- **任何异常（JSON 损坏、游标失效、CLI 错误）都不覆盖上一份完整快照**，部分结果写诊断文件，非零退出。
+- 通知关键词只打 `is_notification` 标签，不删除邮件。
 
-## 阶段2：下载与归档
+> ⚠️ 脚本在 **skill 目录**下，不在项目根。一律用绝对路径。
 
-用户确认后执行。
-
-### 标准附件 — 原子下载（取URL+下载必须在一次操作里）
-
-**用现成脚本（bash 在 Windows cmd 不可用，统一用 node）：**
+### 阶段2：核查附件 + 链接
 
 ```
-node "C:/Users/wuchunbo/.agents/skills/collect-resumes/scripts/download_attachment.mjs" <MID> <输出路径> [附件序号，默认0]
+node "…/collect-resumes/scripts/verify_mails.mjs" [--date 2026-07-10]
 ```
 
-脚本内部：复用 `_verified.json` 的 ATT_ID（没跑过 verify_mails 才实时查）→ 取 download_url → https.get 下载 → **校验 magic bytes**（%PDF/PK 才算 OK，0字节/HTML错误页 exit 4/5/6），**一个进程内完成**。
+- 对每封邮件严格解析详情（JSON 损坏 → blocked，不静默记"零附件"）。
+- 用 HTML 解析器提取**全部** href（支持 `&amp;` 实体解码），覆盖 QQ/网易大附件、126、云盘、ArtStation、普通作品站。
+- 附件和链接各生成 manifest record（稳定 ID：`sha256(message_id + attachment_id)`）。
+- 正文提示有材料但无附件无可提取链接 → blocked。
+- **并发 fetch**（2026-07-29）：`--concurrency N`（默认5）并行查详情，29 封从几分钟降到几十秒。结果与串行完全一致。
 
-> ⚠️ 铁律：**取 URL 和下载必须原子完成，不能分两步。**
-> 飞书 download_url 的 auth code 有时效（几十秒），先取 URL 存下来、过会儿再 curl，会得到 0 字节空文件。
-> 下载完会校验文件头：返回 0 字节（exit 4）/ HTML 错误页（exit 5）/ 非 PDF-ZIP（exit 6）都算失败，要重试。
-
-多封邮件 → 多个 Bash 并行发出，不串行等。
-
-### 链接类附件
-
-见 `references/link-attachments.md`。Playwright MCP 优先，CDP Proxy 补充。
-
-### 归档检查点（最后必跑闸门，不过不许进评估）
-
-1. 先 `ls` 确认目标路径存在，不猜
-2. 归档后更新文件夹份数标注：`find "$DIR" -maxdepth 1 -type f | wc -l`
-3. **美术岗 zip 不许直接用原包**：凡归档压缩包（zip/rar），必须先解压查包内简历 → 脱敏包内简历薪酬 → 重新打包（zip 等价替代，7z 不能建 RAR）→ 再归档。原包原样归档会让薪酬泄漏（os.walk 进不去 zip，闸门扫不到包内）。
-4. 简历文件名不得含薪资信息
-5. Windows 中文编码：lark-cli 输出写文件再 Read，不在 stdout 硬扛
-6. **必跑闸门 `verify_archive.py`（read-only，绝不写盘/删文件，只检测不修复）**：
+### 阶段3：解析记录（绑定身份）
 
 ```
-python "C:/Users/wuchunbo/.agents/skills/collect-resumes/scripts/verify_archive.py" <简历目录或单个pdf/zip> [--no-cache]
+node "…/collect-resumes/scripts/resolve_records.mjs" \
+  --record <record_id> --name 张三 --job 特效设计师 --filename 张三_特效设计师_5年.pdf \
+  [--manifest <PROJECT_ROOT>/notes/collection_manifest.json] [--date 7.29]
 ```
 
-一道命令跑三重校验（zip 会被解压到临时目录扫描包内简历 PDF，扫完即删，read-only 契约不破）：
-- **数量闸门**：`_N份` 目录标注数 == 实际人头数（按姓名去重，zip 整体算 1 份，排除 temp 暂存目录）。挡住"cp/mv 后静默丢文件"
-- **姓名闸门**：按命名规则解析姓名（实习生取第 3 段、正职取第 1 段，剥离【岗位】/简历/作品后缀），token 相等匹配正文署名。挡住"手填 MID 串行错位"
-- **薪酬闸门**：归档后不得残留薪酬段。⚠️ 检出薪酬即 🔴 STOP —— 本脚本**只检测不脱敏**，必须由你用 PyMuPDF redact 脱敏后重跑
+- 岗位目录从归档根**动态发现**（不再依赖手工别名表复制路径）。
+- 歧义岗位（如 Unity 三岗）→ 保持 `needs_resolution`，不自动归档。
+- 路径逃逸 → blocked。
+- **target_dir 落 `{M.DD}_暂定/` 中转目录**（2026-07-29）：resolve 时 N（整批人头数）未知，统一落 `_暂定`，由阶段6闸门自动 rename 为 `_{N}份`。`--date` 默认今天。
+- **归档日期 = 操作日（今天），不是邮件收到日**（2026-07-31 铁律）：昨晚收到但今天才归档的简历，归到**今天**的文件夹 `{M.DD}`（符合工作习惯：你按归档日翻文件夹找）。**除非用户明确指定 `--date`，否则一律不传、用默认今天。** 洪健敏邮件 7.29 收的，今天归档 → 落 `7.31_1份`，不落 `7.29`。
+- **重复投递自动跳过**（2026-07-31 铁律）：resolve 时检查 manifest，**同人同岗已 archived/validated 的 → 标 `duplicate` 跳过，不重复归档**。候选人改简历重投、隔几天再投是常态，已有归档+评估记录的不该再进新批次污染状态。比对键：`candidate_name + job_name`。命中时脚本输出 `⏭️ 跳过`（exit 0，正常退出）。
+  - **Agent 责任**：resolve 前先扫一遍 manifest，对每个 needs_resolution 记录判断是否已存在同人同岗的 archived 记录。这一步脚本已内置，但 Agent 不要"为了批量归档"而绕过——重复就是跳过，不是"提示用户注意去重"。
 
-**增量缓存**：通过的文件（姓名 pass + 无薪酬）会缓存到 `notes/.verified_manifest/`，下次未变动则跳过解析（大目录省一半时间）。安全约束：任何 STOP/⚠️/图片型都不缓存，确保问题文件每次重扫、脱敏后重跑不被旧缓存放行。强制全量扫描加 `--no-cache`。
+> **⛔ 岗位→工作室归属核对（2026-08-06 铁律，resolve 前必做）**
+>
+> 教训：8.05 把"游戏ui设计师"（长青工作室）误归到"UIUE设计师"（坤灵项目），两个不同工作室的不同岗位，评估维度完全不同。根因是 Agent 凭"意思接近"猜岗位目录，没核对工作室前缀。
+>
+> **resolve 前逐个候选人核对**：
+> 1. **BOSS 投递标题的岗位名 → 优先在归档目录里找逐字匹配的末级目录名**，不是"意思接近"的近义词。"游戏ui设计师"→"游戏UI设计师"（逐字），不是"UIUE设计师"（近义但不同岗位）。
+> 2. **`--job` 支持传完整路径前缀**（推荐）：`--job 长青工作室/美术端/游戏UI设计师` → 脚本按路径后缀精确匹配，绝不走模糊匹配，彻底消除跨工作室撞名风险。含 `/` 的 jobName 触发路径前缀匹配模式。
+> 3. **UI/特效/美术类岗位是跨工作室撞名重灾区**——长青有"游戏UI设计师"，坤灵有"UIUE设计师"；长青有"Unity特效设计师"，山海弹珠有"特效设计师"。遇到这类岗位，**必须**带工作室前缀或逐个确认归属。
+> 4. **resolve 后扫一遍 target_dir 的工作室段**：如果总览表里同一岗位名跨工作室出现（如"UI设计师"同时在坤灵和长青），停下来核对归属是否正确。
 
-输出 `🟢 全过 — 可进评估` 才放行；出 `🔴 STOP` 立即修，**不许带错进评估**。图片型 PDF（无文本）或姓名模糊（2 字名疑似他人子串）标 ⚠️ 走人工确认分支，不算失败。
+### 阶段4：下载（record 驱动，事务式）
+
+**附件类（lark-cli API 下载）：**
+
+```
+# 单条
+node "…/collect-resumes/scripts/download_attachment.mjs" \
+  --record <record_id> [--manifest <PROJECT_ROOT>/notes/collection_manifest.json]
+
+# 批量（多个 record，逐个下载 + 间隔，不连发打爆限流）
+node "…/scripts/download_attachment.mjs" \
+  --records "sha256:aaa,sha256:bbb,sha256:ccc" [--throttle 2000] [--manifest <path>]
+```
+
+- **只接受 `--record` / `--records`**，MID/附件ID/目标路径全部从 manifest 派生（旧 `MID + OUT` 默认拒绝）。
+- 下载到 `.part` → 校验 magic bytes + content-length + SHA-256 → 原子 rename 提交。
+- **目标已存在绝不覆盖**：同哈希幂等，异哈希冲突阻断。
+- 应急模式 `--unsafe-manual <MID> <Downloads内路径>` 只能写 Downloads 隔离目录，不进 manifest。
+- **限流重试**（2026-07-30）：`download_url` 接口极易限流（1234029/99991400），现已内置退避重试（指数退避 5/10/20s，最多3次）。`download()` 加 content-length 校验（防 drive-stream 返回 HTTP200+损坏/截断字节流静默通过）。
+- **批量必须用 `--records` 不要自己写循环连发**：飞书 mail API 限流窗口窄，18 连发必触限流雪崩。`--records` 逐个下载 + 每个间隔 `--throttle`（默认 0.5 秒，有 `runWithRetry` 退避兜底一般无需调大），单条失败不中断整批（记 failed 列表，最后汇总，可单独 `--record` 重跑）。
+
+**链接类（QQ/网易大附件，Playwright 批量下载）：**
+
+```
+# 【推荐】当天收简历：指定 record ID 精准下载（只下今天的，不碰历史积压）
+node "…/collect-resumes/scripts/batch_download_links.mjs" \
+  --records "sha256:xxx,sha256:yyy" --manifest <PROJECT_ROOT>/notes/collection_manifest.json
+
+# 清理历史积压：从 manifest 读所有 verified 的 link 记录全量下载
+node "…/scripts/batch_download_links.mjs" --manifest <path>
+
+# 直接传 URL（不走 manifest）
+node "…/scripts/batch_download_links.mjs" --urls "https://wx.mail.qq.com/..." "https://..."
+```
+
+- **⚠️ 当天收简历必须用 `--records` 精准下**：`--manifest` 全量扫会把所有历史 verified 的 link（可能几十条、几个GB）全拖出来串行下载，今天的候选人排在最后。教训（2026-08-04）：全量扫27条历史积压（含1.8GB文件），今天的2人排28/29，白等几小时。
+- 下载成功后**自动写 result.json + 移文件到 target_dir**（2026-08-04 修复）：`merge_results.mjs` 靠 result.json 推进状态，旧版只下到 Downloads 不写 result.json → 状态卡 verified → 下次重复下载。
+- Playwright headless 批量下载，自动检测链接失效。命令参数、fallback 策略详见 `references/link-attachments.md`。
+
+### 阶段5：合并下载结果
+
+```
+node "…/collect-resumes/scripts/merge_results.mjs"
+```
+
+单进程串行合并并行下载的独立结果 JSON 到 manifest，校验哈希一致后推进状态到 `archived`。
+
+### 阶段6：归档闸门（fail-closed）
+
+**先脱敏，再跑闸门。** verify_archive 扫到薪酬会 STOP，所以闸门前必须先脱敏。
+
+```
+# 预览：看哪些文件有薪酬命中（不改文件）
+python "…/collect-resumes/scripts/redact_salary.py" <简历.pdf|docx|zip|rar> --dry-run
+
+# 脱敏单个文件：白色覆盖（禁止黑色，AGENTS.md 铁律）
+python "…/scripts/redact_salary.py" <简历.pdf|docx>
+
+# 脱敏 ZIP 包：自动解压→脱敏包内简历→重打包（一个命令搞定美术岗）
+python "…/scripts/redact_salary.py" <作品集.zip>
+
+# RAR 转 ZIP + 脱敏 + 规范命名（铁律：rar 必须转 zip 才能归档）
+python "…/scripts/redact_salary.py" <黄东亮-场景原画.rar> --output "黄东亮_游戏场景原画_6年_简历加作品.zip"
+
+# 闸门
+python "…/collect-resumes/scripts/verify_archive.py" \
+  <简历目录> [--manifest <PROJECT_ROOT>/notes/collection_manifest.json] [--report-json <path>]
+```
+
+- 五重阻断校验（数量/姓名/薪酬/格式/manifest闭环）详见 `references/archive-contract.md`。
+- **`_暂定` 目录自动校正**（2026-07-29）：闸门 collect 前扫所有 `_暂定` 目录，数人头 rename 为 `_{N}份`，N 永远自洽。
+- **`.doc` 支持**：经 antiword 提取做姓名/薪酬校验；命中薪酬 → STOP（提示转 PDF 后脱敏，antiword 无法涂白矩形）。
+
+输出 `🟢 全过 — 可进评估` 才放行；任何无法验证的情况 `🔴 STOP`。
 
 ---
 
 ## 反模式（不要做）
 
-- **不要信任 triage 的 attachment_count** — 永远是 0，必须用 +message 查
-- **不要只查 attachments 就下结论** — attachments 和 body 链接并存，每封都要查 body_html
 - **不要把取 URL 和下载拆成两步** — auth code 有时效，原子完成
-- **不要假设下载目录** — 真实是 `F:/Users/wuchunbo/Downloads`（F 盘），不是 C 盘的 USERPROFILE
-- **不要现场写一次性脚本** — 扫描/下载/核查都用 `scripts/` 里现成的，AI 负责判断不负责重复造轮子
-- **不要写规则脚本做岗位匹配** — AI 直接判断比规则可靠
-- **不要串行下载** — 能并行就并行
+- **不要自己写循环连发批量下载附件** — 飞书 mail API 限流窗口窄，连发必雪崩拿损坏数据。用 `download_attachment.mjs --records id1,id2,...`（内置逐个+间隔+限流重试）
+- **不要手动解压→脱敏→重打包美术岗 zip** — `redact_salary.py` 已支持 zip/rar 自动解压脱敏重打包，一个命令搞定
+- **不要逐个手动浏览器下载 QQ 大附件** — 用 `batch_download_links.mjs` 批量下载
 - **不要用 curl 下载链接类附件** — 只拿到 HTML 跳转页，必须用浏览器
-- **不要在 stdout 输出中文** — Windows GBK 会乱码，写文件再 Read
-- **不要手填 MID 下载** — MID↔文件名的对应必须由脚本数据绑定，不靠肉眼"读 JSON 再手填命令"。错配根因就在这一跳，已用 `verify_archive.py` 姓名闸门兜底：下载后文件名姓名 ∉ 正文即 STOP。
-- **不要 cp/mv 后不数文件** — 曾两次静默丢简历都因操作后没对账。`verify_archive.py` 数量闸门已固化此检查：`_N份` 标注 ≠ 实际数即 STOP。
-- **姓名对不上先自查下载环节** — 邮件 MID↔投递姓名↔简历内容通常自洽，姓名不符基本是下载填串，不要急着甩锅"投递者填错名"。
+- **不要 cp/mv 后不数文件** — `verify_archive.py` 数量闸门兜底
+- **不要跳过 verify_archive 直接进评估** — 无法验证的文件必须阻断
+- **不要给 scan_all 传 --date** — 脚本不解析它，全量扫描；日期过滤在阶段2 verify_mails 做
+- **不要当天收简历用 `batch_download_links --manifest` 全量扫** — 会把所有历史 verified 链接（可能几十条、几个GB）全拖出来串行下载，今天的人排在最后。用 `--records` 精准下
 
 ---
 
 ## 脚本
 
-> 所有脚本都在 **skill 目录** `C:/Users/wuchunbo/.agents/skills/collect-resumes/scripts/` 下，**不在项目根 `F:/miniwanob/scripts/`**（那个目录不存在）。调用时一律用绝对路径，不要写 `scripts/xxx` 相对路径，否则报 `Cannot find module`。
+> 所有脚本在 **skill 目录** `…/collect-resumes/scripts/`。
 
 | 脚本 | 用途 |
 |------|------|
-| `…/scripts/download_attachment.sh` | 单封邮件附件下载（bash 版，Linux/mac） |
-| `…/scripts/download_attachment.mjs` | 单封邮件附件下载（**node 版，Windows 用这个**，原子操作） |
-| `…/scripts/scan_all.mjs` | 全量扫描邮箱，分页到 has_more=false，排除通知 |
-| `…/scripts/verify_mails.mjs` | 逐封核查附件数 + body 链接，防止漏作品 |
-| `…/scripts/verify_archive.py` | **归档闸门**（read-only）：数量/姓名/薪酬三重校验，挡 MID 填串 + 静默丢文件 + 薪酬残留 |
+| `…/scripts/scan_all.mjs` | 全量扫描邮箱，原子发布完整快照 |
+| `…/scripts/verify_mails.mjs` | 严格核查附件+链接，生成 manifest records（并发 fetch `--concurrency`） |
+| `…/scripts/resolve_records.mjs` | 绑定候选人/岗位/目标路径到记录（落 `_暂定` 中转目录） |
+| `…/scripts/download_attachment.mjs` | record 驱动事务式下载（`.part`→校验→原子提交；支持 PDF/DOCX/**.doc**/ZIP；**限流退避重试**；`--records` 批量逐个+间隔） |
+| `…/scripts/batch_download_links.mjs` | **链接类附件批量下载**（Playwright headless，QQ/网易大附件，自动检测失效） |
+| `…/scripts/merge_results.mjs` | 合并并行下载结果到 manifest（幂等状态推进，单条失败不中断整批） |
+| `…/scripts/redact_salary.py` | 薪酬脱敏（白色覆盖，PDF/DOCX/**.doc**/**ZIP/RAR**；.doc 命中薪酬→阻断提示转PDF；rar自动转zip；`--output`规范命名；解压前过安全关口） |
+| `…/scripts/verify_archive.py` | 归档闸门（数量/姓名/薪酬/格式/manifest 闭环） |
+| `…/scripts/lib/manifest.mjs` | 稳定 ID/状态机/原子写入 |
+| `…/scripts/lib/retry.mjs` | **限流退避重试**（识别 1234029/99991400，指数退避，最多3次；可复用） |
+| `…/scripts/lib/lark_mail.mjs` | 严格 lark-cli 响应解析 |
+| `…/scripts/lib/html_links.mjs` | HTML 链接提取与分类 |
+| `…/scripts/lib/file_identity.mjs` | SHA-256/类型检测/冲突保护 |
+| `…/scripts/lib/paths.mjs` | 路径常量单一真相源 |
+| `…/scripts/lib/notifications.mjs` | 通知邮件关键词/过滤 |
+| `…/scripts/content_extractors.py` | PDF/OCR/DOCX 统一内容提取 |
+| `…/scripts/archive_safety.py` | ZIP 安全检查（路径穿越/加密/嵌套/炸弹） |
+| `…/scripts/salary_pattern.py` | 薪酬正则单一真相源（verify_archive + redact_salary 共用） |
+| `…/scripts/paths.py` | Python 路径常量（SEVEN_ZIP/缓存目录） |
 
-> `…/` = `C:/Users/wuchunbo/.agents/skills/collect-resumes`
+> `…/` = `…/collect-resumes`
 
 ## 参考文档
 
-按需加载，不要预读：
-- `references/job-aliases.md` — 岗位别名映射表（含团队路径）
-- `references/archive-naming.md` — 目录结构、文件命名规则
+按需加载：
+- `references/archive-contract.md` — 归档结构单一真相源
+- `references/job-aliases.md` — 岗位别名和歧义规则（路径以磁盘为准）
+- `references/archive-naming.md` — 美术岗打包规则
 - `references/link-attachments.md` — 链接类附件下载策略

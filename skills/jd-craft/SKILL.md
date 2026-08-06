@@ -43,7 +43,7 @@ JD 是招聘漏斗的**源头**——源头歪了，后面收简历、筛简历�
 2. **fallback** `pandoc <岗位文件夹>/<岗位名>.docx -t markdown`（docx 转 markdown，保留结构）
 3. **兜底** 用户直接在对话里贴 JD 文本（新岗位还没建文件夹时）
 
-**定位岗位文件夹**：遍历 `F:/miniwanob/data/在招岗位候选人管理/**/<岗位名>/`，或用户直接给路径。
+**定位岗位文件夹**：遍历 `<PROJECT_ROOT>/data/在招岗位候选人管理/**/<岗位名>/`，或用户直接给路径。
 **读取命令**（docx fallback）：
 ```bash
 pandoc "data/在招岗位候选人管理/<团队>/<岗位>/<岗位名>.docx" -t markdown
