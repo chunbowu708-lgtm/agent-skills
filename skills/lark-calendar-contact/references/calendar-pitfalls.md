@@ -59,7 +59,7 @@ freebusy 反推出的空闲段可能横跨午夜（如 `22:00-次日 09:00`）�
 Windows 下裸 `"lark-cli"` 报 `WinError 2`（找不到文件）。必须用：
 
 ```python
-CLI = r"C:\Users\wuchunbo\AppData\Roaming\npm\lark-cli.cmd"
+CLI = os.environ.get("LARK_CLI_PATH", "lark-cli")
 ```
 
 或走 `_lark_shared.cli()`（已封装全路径 + `MSYS_NO_PATHCONV=1` + utf-8 encoding）。
