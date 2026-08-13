@@ -48,7 +48,7 @@
 字段分三层，每层只有一个写权方（详细字段表 + ATS→表映射见 review-contract.md）：
 - 客观层（状态/轮次/面试时间/进入阶段日期）：只归 `_daily_review.py --write`
 - 主观层（下一步动作/优先级/备注/面试官）：归人工
-- 主键层 talent_id：归 `track_after_hire.py`（新录入）/ `backfill_talent_id.py`（存量）
+- 主键层 talent_id：归 `_hire.py`（录入时自动写）。存量回填是一次性历史任务，已完成。
 - 约束：多写权方共存 = 数据必然漂移。ATS 是唯一事实源，分层是正确性约束不是风格偏好。
 
 ## 接棒保温必须强制（step 6）

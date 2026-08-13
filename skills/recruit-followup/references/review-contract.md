@@ -35,7 +35,7 @@
 | `stuck` | 卡住 ≥2 天 | `talent_id, name, stage, dwell_days, level, reason`。**reason 含"⚠️零记录"**：面试阶段零面试记录，既不在 feedback_overdue 也不在 to_advance，最易漏报 |
 | `to_advance` | 面评通过待推进下一轮 | `talent_id, name, stage, passed_round, dwell_days` |
 | `feedback_overdue` | **最新一场**面试已过无面评（不追溯旧场）| `talent_id, name, round, round_type, interview_time, interviewers[], overdue_days, urgency`。`interviewers`=面试官名字列表（催面评直用）；`urgency`=🔴严重(≥14天)/🟠常规(4-14天)/🟡可缓(<4天) |
-| `today_interviews` | 今日面试 | `talent_id, name, time, weekday, summary, in_track, interview_type, location, meeting_room, round, interviewer, video_url`。后 6 个字段从日历 description 解析：`interview_type`=现场面试/视频面试；`location`=线下地址（视频面试为空）；`meeting_room`=会议室房间名；`round`=轮次；`interviewer`=面试官；`video_url`=视频链接（仅视频面试）。`weekday`=今天周几（中文，如"周二"，脚本算好供 Agent 直接用，**根除手算星期高频出错**） |
+| `today_interviews` | 今日面试 | `talent_id, name, time, weekday, summary, in_track, job, dept, interview_type, location, meeting_room, round, interviewer, video_url`。`job`/`dept`=岗位/团队（2026-08-13 补，供 1A 时间线标注项目团队岗位，与 upcoming_interviews/ats 同源）。后 6 个字段从日历 description 解析：`interview_type`=现场面试/视频面试；`location`=线下地址（视频面试为空）；`meeting_room`=会议室房间名；`round`=轮次；`interviewer`=面试官；`video_url`=视频链接（仅视频面试）。`weekday`=今天周几（中文，如"周二"，脚本算好供 Agent 直接用，**根除手算星期高频出错**） |
 | `upcoming_interviews` | **本周未来面试**（今天之后、+7天内已排期） | `talent_id, name, time, weekday, summary, job, dept, interview_type, meeting_room, round, interviewer`。`weekday`=该面试日期周几（中文）。直接遍历日历 events 兜底（含非我岗位，防 `_my_jobs.json` 过期漏报），通过 application_id 关联 ATS 富化 name/job/dept。同投递同轮次去重，按时间排序。供作战清单模块一 1D 前瞻视图 |
 | `track_vs_ats_gaps` | 跟踪表落后 ATS | `talent_id, name, ats_stage, track_status, match, mismatch, _rid` |
 | `untracked_in_ats` | ATS 有、跟踪表无（漏建行） | `talent_id, name, job, stage, dwell_days` |
@@ -84,7 +84,7 @@
 
 > 生产者：`<PROJECT_ROOT>/notes/_hire.py`（recruit-followup 录入流程）
 > 产物：`<PROJECT_ROOT>/notes/_hire_result.json`
-> 消费者：`track_after_hire.py`（建跟踪表行）、`verify_hire.py`（录入闸门校验）
+> 消费者：`_hire.py` 内联的 `finalize`（录入后原子化收尾：`track_person` 建跟踪表行 → `verify_person` 三段闸门校验）——2026-08-13 起无独立 track/verify 脚本/转发器函数，逻辑已内联进 `_hire.py` 的 `finalize`
 
 | 项 | 值 |
 |---|---|
@@ -98,7 +98,7 @@
 |---|---|---|
 | `name` | ✅ | 姓名（解析失败时为传入的 name_hint 或"未知名"）|
 | `file` | ✅ | 简历文件名 |
-| `path` | ✅ | 简历**绝对路径**（供 track_after_hire.py 推断部门/职能）|
+| `path` | ✅ | 简历**绝对路径**（供 `_hire.py::track_person` 的 `_infer_dept_func` 推断部门/职能）|
 | `job_code` | ✅ | 岗位编号（A 开头）|
 | `ok` | ✅ | bool，是否录入成功 |
 | `talent_id` | 成功时 | 飞书人才 id |
@@ -111,8 +111,8 @@
 | `error` | 失败时 | 错误信息 |
 
 **消费约定**：
-- `track_after_hire.py`：只处理 `ok==true` 的元素；读 `name/talent_id/job_title/path` 建跟踪表行。
-- `verify_hire.py`：只校验 `ok==true && talent_id` 非空的元素；用 talent_id 反查 talent 姓名邮箱（防误关联）、查投递岗位（防投错）、核对跟踪表是否建行。
+- `_hire.py` 的 `finalize`（内部 `track_person`）：只处理 `ok==true` 的元素；读 `name/talent_id/job_title/path` 建跟踪表行。
+- `_hire.py` 的 `finalize`（内部 `verify_person`）：只校验 `ok==true && talent_id` 非空的元素；用 talent_id 反查 talent 姓名邮箱（防误关联）、查投递岗位（防投错）、核对跟踪表是否建行。
 
 ---
 
@@ -128,7 +128,7 @@
 |---|---|---|---|
 | **客观层** | 状态、当前轮次、面试时间、进入阶段日期 | `_daily_review.py --write` 或 `_sync_tables.py`（定时同步，ATS 同步） | 禁止人/agent 手改（guard_track_write.py 拦截） |
 | **主观层** | 下一步动作、优先级、备注、面试官 | 人工（脚本只填空槽，不覆盖已有值） | 脚本 `--write` / `--sync` 跳过非空主观字段 |
-| **主键层** | talent_id | `track_after_hire.py`（新录入）/ `backfill_talent_id.py`（存量回填） | 禁止人改 |
+| **主键层** | talent_id | `_hire.py` 录入时自动写入（`track_person`） | 禁止人改 |
 
 ### 岗位表同步（YOUR_JOB_TABLE_ID）
 
@@ -201,9 +201,9 @@
 
 ### talent_id 主键约定
 
-- `track_after_hire.py` 录入时自动写入 `talent_id` 列（fldSTYVNJ2）
+- `_hire.py` 录入时自动写入 `talent_id` 列（fldSTYVNJ2）
 - **录入侧查重也用 talent_id 主键**（与对账侧一致）：传入 talent_id 精确命中 → UPDATE；表里同 name 行 talent_id 空 → UPDATE 补 tid；表里同 name 行 talent_id 非空且不匹配 → 跳过防同名错配；双索引都不命中 → CREATE
 - UPDATE 时不写 talent_id 字段（主键层不被覆盖）；只有 CREATE 才写 talent_id（含可能为空串占位）
-- 存量行用 `backfill_talent_id.py` 一次性回填（dry-run 确认后 --write）
+- 存量行 talent_id 回填是一次性历史任务，已完成（原 `backfill_talent_id.py` 已删，2026-08-13）；新录入由 `_hire.py` 自动写 talent_id，无需回填
 - 对账用 `talent_id` 精确匹配，降级姓名（同名多人跳过不盲填）
 - `track_vs_ats_gaps` 的 `match` 字段值：`talent_id`（精确命中）或 `姓名`（降级）

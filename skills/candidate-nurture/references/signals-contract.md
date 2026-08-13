@@ -1,10 +1,10 @@
 # signals-contract.md — 信号与决策 JSON 数据契约
 
-> 生产者：Agent（recruit-followup 早晨对账时执行，非脚本）
+> 生产者：Agent（recruit-followup 早晨对账时执行判读）+ `signals.py` 工具落盘（recruit-followup/scripts/signals.py）
 > 产物：`<PROJECT_ROOT>/notes/_signals.json`
 > 消费者：candidate-nurture（交叉比对预警数据 + 保温状态，产出保温清单）
 >
-> **铁律：本文件由 Agent 手动写，不由 `_daily_review.py` 产出。不同生产者 = 不同文件。**
+> **铁律：Agent 判读，工具落盘。** 判读（LLM 从 raw_messages 提取意图）是 Agent 的活；写文件（talent_id 匹配 + 枚举校验 + 原子写）是 `signals.py` 的活——Agent 不手写 JSON（2026-08-13 起）。本文件不由 `_daily_review.py` 产出。不同生产者 = 不同文件。
 > 与 `review-contract.md`（脚本产出的 `_daily_review.json` 契约）互补，不重复。
 
 ## 为什么需要这个文件
@@ -20,7 +20,7 @@
 | 项 | 值 |
 |---|---|
 | 路径 | `notes/_signals.json`（项目根相对） |
-| 生成方式 | Agent 写（非脚本） |
+| 生成方式 | `signals.py --set/--decide`（Agent 判读后写临时 JSON，工具自动补 talent_id + 校验 + 原子写） |
 | 生成时机 | recruit-followup 早晨对账 step 3.5（判读完 raw_messages 后）+ step 4.5（用户决策后） |
 | 新鲜度 | 顶层 `date`（YYYY-MM-DD）；消费者用前校验 `date == 今天`，过期提示重跑 |
 | 不存在时 | candidate-nurture **拒绝执行**（前置 gate 失败，不产出清单），引导用户先完成 recruit-followup 早晨对账 |
@@ -111,9 +111,9 @@
 
 | 部分 | 写权方 | 时机 |
 |---|---|---|
-| `signals` | Agent（recruit-followup step 3.5） | LLM 判读完 raw_messages 后立即写 |
-| `decisions` | Agent（recruit-followup step 4.5） | 用户审查作战清单并做决策后写 |
-| 整文件 | Agent | 每天早晨覆盖写（同一天的判读结果累积更新） |
+| `signals` | `signals.py --set`（Agent 判读结果，recruit-followup step 3.5） | LLM 判读完 raw_messages 后立即写 |
+| `decisions` | `signals.py --decide`（Agent 传递用户决策，recruit-followup step 4.5） | 用户审查作战清单并做决策后写 |
+| 整文件 | `signals.py` 工具 | 每天早晨覆盖写 signals（`--set` 保留 decisions）；`--decide` 只改 decisions |
 
 > **注意**：`_signals.json` 是**当天有效**的快照，不跨天累积。历史的 signals 不需要保留（它们要么变成了 ATS 记录，要么已经失效）。如果需要历史追溯，查 `notes/history/` 下的快照（如果未来加入归档）。
 

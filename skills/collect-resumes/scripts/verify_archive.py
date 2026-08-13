@@ -25,7 +25,7 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
 from content_extractors import extract as extract_content
-from archive_safety import check_zip
+from archive_safety import check_zip, decode_zip_name
 from salary_pattern import SALARY
 from paths import SEVEN_ZIP, CACHE_DIR
 
@@ -63,15 +63,15 @@ def _is_tier_dir(name):
 
 
 def _zip_decode_name(info):
-    """还原 zip 内中文文件名（Windows 下用 GBK 编码，python 默认 cp437 解出乱码）。
-    带 0x800 UTF-8 标志的直接用原名，否则 cp437→gbk 还原。"""
-    name = info.filename
-    if info.flag_bits & 0x800:
-        return name
-    try:
-        return name.encode("cp437").decode("gbk")
-    except Exception:
-        return name
+    """还原 zip 内中文文件名。委托给 archive_safety.decode_zip_name（单一真相源）。
+
+    原实现有两处 bug（2026-08-13 修）：
+    1. `flag_bits & 0x800` 直接返回原名——但实测某些工具设了 0x800 却仍按 UTF-8 字节写入，
+       Python 解出来还是 cp437 乱码，直接返回 = 返回乱码。
+    2. 只试 `cp437→gbk`——但网盘/邮箱类 zip 常用 UTF-8 字节，gbk 解不出（byte 0xaa 越界），
+       落到 except 返回乱码原名。
+    统一走 decode_zip_name（含中文直接用 → utf-8 优先 → gbk 兜底）。"""
+    return decode_zip_name(info)
 
 
 # ---- 文件名姓名解析 ----
@@ -275,11 +275,6 @@ def sha256_file(path):
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.digest().hex()
-
-def file_sig(real):
-    """mtime+size 快筛（只做性能提示，不做安全判定）。"""
-    st = os.stat(real)
-    return (int(st.st_mtime), st.st_size)
 
 
 def _count_heads(dirpath):
@@ -505,13 +500,11 @@ def main():
             fname = display.split("!")[-1].split("/")[-1]
             fn_name = parse_name(os.path.basename(fname))
 
-            # SHA-256 缓存（最终键是内容哈希，mtime+size 只做快筛）
+            # SHA-256 缓存（最终键是内容哈希）
             try:
                 content_sha = sha256_file(real)
-                sig = file_sig(real)
             except OSError:
                 content_sha = None
-                sig = None
 
             cache_key = display
             cached = cache.get(cache_key)
@@ -562,7 +555,7 @@ def main():
                 name_issues.append(display)
             # 只缓存"姓名 pass + 无薪酬 + 未阻断"
             if file_clean and scan_salary and not this_sal and content_sha:
-                new_cache[cache_key] = {"sha256": content_sha, "name": fn_name, "sig": list(sig) if sig else []}
+                new_cache[cache_key] = {"sha256": content_sha, "name": fn_name}
 
         if use_cache:
             save_manifest_cache(args.target, new_cache)

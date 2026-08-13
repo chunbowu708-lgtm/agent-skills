@@ -91,7 +91,7 @@ for k in ['feedback_overdue','stuck','to_advance']:
 
 ## 阶段1.3：读信号数据（交叉比对 LLM 判读 + 用户决策）
 
-> 数据来源：`notes/_signals.json`（recruit-followup 早晨对账时 Agent 写入）
+> 数据来源：`notes/_signals.json`（recruit-followup 早晨对账时 Agent 判读 + `signals.py` 落盘）
 > 契约：[`references/signals-contract.md`](references/signals-contract.md)
 
 读两个列表：

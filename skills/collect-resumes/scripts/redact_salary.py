@@ -24,7 +24,7 @@ redact_salary.py — 简历薪酬脱敏（PDF / DOCX / ZIP 内嵌文件）
 退出码：0=成功（已脱敏或无需脱敏）；1=出错
 """
 
-import sys, os, re, io, zipfile, tempfile, shutil, argparse, subprocess
+import sys, os, re, io, json, zipfile, tempfile, shutil, argparse, subprocess
 
 try:
     import fitz  # PyMuPDF
@@ -34,15 +34,21 @@ except ImportError:
 
 from salary_pattern import SALARY
 from paths import SEVEN_ZIP
-from archive_safety import check_zip
+from archive_safety import check_zip, decode_zip_name
 
 # 白色覆盖（铁律：禁止黑色）
 FILL_COLOR = (1, 1, 1)
+
+# 图片型 PDF 渲染 DPI（薪酬定位需要足够清晰，200dpi 够 OCR）
+RENDER_DPI = 200
 
 
 def redact_pdf(pdf_path, patterns=None, dry_run=False):
     """脱敏 PDF：用白色矩形覆盖薪酬文本。
     返回 (命中数, 是否修改)。
+
+    自动检测图片型/BOSS加密文本层：当文本层提取不到薪酬且页面有图片时，
+    fallback 到 OCR 路径（渲染页面→OCR定位薪酬像素bbox→反推PDF坐标→白矩形覆盖）。
     """
     doc = fitz.open(pdf_path)
     regex = _build_regex(patterns)
@@ -77,6 +83,176 @@ def redact_pdf(pdf_path, patterns=None, dry_run=False):
         shutil.move(pdf_path + '.tmp', pdf_path)
     else:
         doc.close()
+
+    # 文本层无命中 → 检查是否图片型/BOSS加密，是则走 OCR 路径
+    # （图片型 PDF 文本层是空的或乱码 token，薪酬文字只在渲染层图像里）
+    if not hits:
+        ocr_hits, ocr_modified = _redact_pdf_via_ocr(pdf_path, patterns, dry_run)
+        if ocr_hits:
+            return ocr_hits, ocr_modified
+
+    return hits, modified
+
+
+def _is_image_pdf(doc):
+    """检测是否是图片型 PDF：文本层字符少 或 页面以图片为主。"""
+    total_text_len = sum(len(page.get_text().strip()) for page in doc)
+    if total_text_len < 50:  # 几乎无文本 → 扫描件/纯图片
+        return True
+    # 检查是否有 BOSS token 行（文本层是乱码）
+    for page in doc:
+        text = page.get_text()
+        lines = [l for l in text.split("\n") if l.strip()]
+        if lines:
+            token_like = sum(1 for l in lines
+                             if not re.search(r"[\u4e00-\u9fff]", l)
+                             and (re.match(r"^[0-9a-f]{8,}", l) or "~~" in l))
+            if token_like / len(lines) > 0.5:
+                return True
+    return False
+
+
+def _get_ocr_engine():
+    """获取可用的 OCR 引擎（延迟导入）。返回 (engine, name) 或 (None, None)。
+
+    优先级：easyocr（纯Python不需外部二进制）> pytesseract（需tesseract二进制）。
+    """
+    try:
+        import easyocr
+        # chi_sim+en 模型首次用会自动下载（约几十MB）
+        if not hasattr(_get_ocr_engine, "_reader"):
+            _get_ocr_engine._reader = easyocr.Reader(["ch_sim", "en"], gpu=False)
+        return _get_ocr_engine._reader, "easyocr"
+    except ImportError:
+        pass
+    try:
+        import pytesseract
+        pytesseract.get_tesseract_version()  # 测试二进制是否可用
+        return pytesseract, "pytesseract"
+    except Exception:
+        pass
+    return None, None
+
+
+def _ocr_locate_salary(img_path, regex, engine_name, engine):
+    """用 OCR 识别图片文字+位置，匹配薪酬正则，返回 [(text, [pixel_bboxes])]。
+
+    pixel_bbox = [x_min, y_min, x_max, y_max]（像素坐标，左上角0,0）
+    """
+    results = []
+    if engine_name == "easyocr":
+        # easyocr 返回 [(bbox, text, confidence)]
+        detections = engine.readtext(img_path)
+        for bbox, text, conf in detections:
+            if regex.search(text):
+                # bbox 是 4 个角点 [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+                xs = [p[0] for p in bbox]
+                ys = [p[1] for p in bbox]
+                pixel_rect = [min(xs), min(ys), max(xs), max(ys)]
+                results.append((text, [pixel_rect]))
+    elif engine_name == "pytesseract":
+        from PIL import Image
+        img = Image.open(img_path)
+        # image_to_data 返回每个词的位置
+        data = engine.image_to_data(img, lang="chi_sim+eng", output_type=engine.Output.DICT)
+        # 把相邻词组合成行，按行匹配薪酬正则
+        lines = {}
+        for i in range(len(data["text"])):
+            if not data["text"][i].strip():
+                continue
+            key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+            if key not in lines:
+                lines[key] = {"texts": [], "lefts": [], "tops": [], "rights": [], "bottoms": []}
+            lines[key]["texts"].append(data["text"][i])
+            l, t, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+            lines[key]["lefts"].append(l)
+            lines[key]["tops"].append(t)
+            lines[key]["rights"].append(l + w)
+            lines[key]["bottoms"].append(t + h)
+        for key, info in lines.items():
+            line_text = "".join(info["texts"])
+            if regex.search(line_text):
+                pixel_rect = [min(info["lefts"]), min(info["tops"]),
+                              max(info["rights"]), max(info["bottoms"])]
+                results.append((line_text, [pixel_rect]))
+    return results
+
+
+def _pixel_to_pdf_rect(pixel_bbox, img_width, img_height, page_rect):
+    """像素坐标 → PDF 坐标（fitz.Rect）。
+
+    渲染时 dpi=200，PDF 原始坐标按比例缩放回来。
+    page_rect 是 fitz 页面的 Rect（PDF 点坐标）。
+    """
+    x_min, y_min, x_max, y_max = pixel_bbox
+    # 归一化（0-1）再映射到 PDF 坐标
+    sx0 = page_rect.x0 + (x_min / img_width) * page_rect.width
+    sy0 = page_rect.y0 + (y_min / img_height) * page_rect.height
+    sx1 = page_rect.x0 + (x_max / img_width) * page_rect.width
+    sy1 = page_rect.y0 + (y_max / img_height) * page_rect.height
+    # 稍微向内收缩避免覆盖到相邻字段，但保证覆盖完整（不收缩太多）
+    return fitz.Rect(sx0, sy0, sx1, sy1)
+
+
+def _redact_pdf_via_ocr(pdf_path, patterns=None, dry_run=False):
+    """图片型/BOSS加密 PDF 的 OCR 脱敏路径。
+
+    1. 检测是否图片型（不是则返回空，让上层走正常文本路径）
+    2. 获取 OCR 引擎（easyocr/pytesseract），无可用引擎则渲染图片提示主会话处理
+    3. 逐页渲染→OCR定位薪酬→像素bbox反推PDF坐标→白色覆盖
+    """
+    doc = fitz.open(pdf_path)
+    if not _is_image_pdf(doc):
+        doc.close()
+        return [], False
+
+    engine, engine_name = _get_ocr_engine()
+    if engine is None:
+        # 无 OCR 引擎 → 渲染图片输出路径，提示主会话用视觉模型定位
+        doc.close()
+        if dry_run:
+            print("  ⚠️  图片型PDF检测到，但无OCR引擎（easyocr/pytesseract）", file=sys.stderr)
+            print("     安装任一：pip install easyocr（或装 tesseract 二进制）", file=sys.stderr)
+            print("     或用主会话视觉模型定位薪酬后传坐标", file=sys.stderr)
+        return [("__NO_OCR_ENGINE__", "图片型PDF需OCR引擎，未安装")], False
+
+    regex = _build_regex(patterns)
+    hits = []
+    modified = False
+    zoom = RENDER_DPI / 72  # PDF 默认 72dpi
+    mat = fitz.Matrix(zoom, zoom)
+    tmpdir = tempfile.mkdtemp(prefix="_redact_ocr_")
+
+    try:
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            pix = page.get_pixmap(matrix=mat)
+            img_path = os.path.join(tmpdir, f"p{page_num+1}.png")
+            pix.save(img_path)
+
+            # OCR 定位薪酬
+            ocr_hits = _ocr_locate_salary(img_path, regex, engine_name, engine)
+            for match_text, pixel_bboxes in ocr_hits:
+                rects = []
+                for pb in pixel_bboxes:
+                    rect = _pixel_to_pdf_rect(pb, pix.width, pix.height, page.rect)
+                    rects.append(rect)
+                    if not dry_run:
+                        page.add_redact_annot(rect, fill=FILL_COLOR)
+                hits.append((f"p{page_num+1}(OCR)", match_text))
+
+            if ocr_hits and not dry_run:
+                page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+                modified = True
+
+        if modified and not dry_run:
+            doc.save(pdf_path + '.tmp')
+            doc.close()
+            shutil.move(pdf_path + '.tmp', pdf_path)
+        else:
+            doc.close()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
     return hits, modified
 
@@ -167,10 +343,20 @@ def redact_zip(zip_path, patterns=None, dry_run=False):
             print(f"❌ ZIP 安全检查失败（拒绝解压）: {safety.reason}", file=sys.stderr)
             return [("__BLOCKED__", safety.reason)], False
 
-        # 解压
+        # 解压（还原中文名后手动落盘，避免 extractall 把 cp437 乱码名写进磁盘）
+        # 2026-08-13 修：extractall 用 info.filename 当目标路径，中文名被 cp437 解成
+        # 乱码（如"游戏主美"→"µ╕╕µêÅ"），重打包后 zip 内文件名仍是乱码。
+        names = []
         with zipfile.ZipFile(zip_path, 'r') as zin:
-            zin.extractall(tmpdir)
-            names = zin.namelist()
+            for info in zin.infolist():
+                if info.is_dir():
+                    continue
+                real_name = decode_zip_name(info)
+                target = os.path.join(tmpdir, real_name.replace("\\", "/"))
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zin.open(info) as src, open(target, 'wb') as dst:
+                    dst.write(src.read())
+                names.append(real_name)
 
         # 逐个处理内嵌简历
         for name in names:
@@ -361,21 +547,18 @@ def _check_rar_safety(rar_path):
         return f"7z 列成员返回非0: {(r.stderr or '')[:100]}"
 
     # 解析 -slt 输出：每个成员有 Path = ... 行
-    # ⚠️ 7-Zip `-slt` 的第一行 Path = 是归档自身的绝对路径（archive header），
-    # 不是成员；成员路径都是相对的（如 "子目录/文件"）。归档头只在第一条出现一次，
-    # 跳过它，否则会把归档全路径误判为"绝对路径穿越"而 fail-closed 误阻断。
-    # 注意：归档头文件名可能是 GBK 乱码，无法字符串相等匹配，靠"首位 + 盘符开头"识别。
+    # ⚠️ 7-Zip `-slt` 的第一条 Path = 恒为归档自身（archive header），
+    # 不是成员；后续 Path = 才是成员（相对路径如 "子目录/文件"）。
+    # 无条件跳过第一条——不靠路径形式判断：用相对路径调 redact_salary 时
+    # 归档头也是相对路径，靠盘符正则会漏判，导致归档头被当成"嵌套 .rar 成员"误阻断。
     paths = []
     seen_first_path = False
     for line in r.stdout.splitlines():
         if line.startswith("Path ="):
             val = line[len("Path ="):].strip()
-            norm = val.replace("\\", "/")
             if not seen_first_path:
                 seen_first_path = True
-                # 第一条 Path = 是归档头（绝对路径），跳过
-                if re.match(r"^[A-Za-z]:[\\/]", norm) or norm.startswith("//"):
-                    continue
+                continue  # 第一条 Path = 恒为归档头，无条件跳过
             paths.append(val)
 
     for p in paths:
@@ -485,48 +668,151 @@ def _locate_match_in_dict(page, text, start, end):
 
 # ---- CLI ----
 
+def redact_pdf_rects(pdf_path, rects_json, dry_run=False):
+    """用外部传入的坐标直接在 PDF 上画白色矩形覆盖。
+
+    用于图片型/BOSS加密 PDF：OCR 精度不够时，由主会话用视觉模型
+    定位薪酬位置，把坐标传给本函数画白矩形。
+
+    rects_json 格式：
+    [
+      {"page": 1, "dpi": 200, "bbox": [x_min, y_min, x_max, y_max]},
+      ...
+    ]
+    page 是 1-based 页码，dpi 是渲染时的 DPI（用于坐标反推），
+    bbox 是该 DPI 下渲染图片的像素坐标。
+    """
+    rects = json.loads(rects_json) if isinstance(rects_json, str) else rects_json
+    doc = fitz.open(pdf_path)
+    hits = []
+    modified = False
+
+    for r in rects:
+        page_num = r["page"] - 1  # 转 0-based
+        dpi = r.get("dpi", 200)
+        bbox = r["bbox"]
+        if page_num >= len(doc):
+            continue
+        page = doc[page_num]
+        zoom = dpi / 72
+        # 像素坐标 → PDF 坐标
+        sx0 = bbox[0] / zoom
+        sy0 = bbox[1] / zoom
+        sx1 = bbox[2] / zoom
+        sy1 = bbox[3] / zoom
+        rect = fitz.Rect(sx0, sy0, sx1, sy1)
+        if not dry_run:
+            page.add_redact_annot(rect, fill=FILL_COLOR)
+        hits.append((r["page"], f"外部坐标 {bbox}"))
+
+    if hits and not dry_run:
+        for r in rects:
+            page = doc[r["page"] - 1]
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+        doc.save(pdf_path + '.tmp')
+        doc.close()
+        shutil.move(pdf_path + '.tmp', pdf_path)
+        modified = True
+    else:
+        doc.close()
+
+    return hits, modified
+
+
 def main():
     parser = argparse.ArgumentParser(description="简历薪酬脱敏（白色覆盖，禁止黑色）+ rar转zip")
-    parser.add_argument("file", help="PDF / DOCX / ZIP / RAR / 7z 文件路径")
+    parser.add_argument("file", nargs="?", help="PDF / DOCX / ZIP / RAR / 7z 文件路径（单文件模式）")
+    parser.add_argument("--dir", help="目录模式：递归脱敏该目录下所有 pdf/docx/zip/rar（批量，一条命令代替逐个跑）")
     parser.add_argument("--patterns", nargs="*", help="自定义薪酬关键词（默认用 verify_archive 同款正则）")
     parser.add_argument("--dry-run", action="store_true", help="只报告命中，不改文件")
     parser.add_argument("--output", help="输出文件路径（rar转zip时指定规范命名；zip默认原地覆盖）")
+    parser.add_argument("--redact-rects", help="外部传入薪酬坐标JSON（图片型PDF专用）：[{page,dpi,bbox:[x,y,x,y]}]")
     args = parser.parse_args()
 
-    filepath = args.file
+    if args.dir:
+        if args.output or args.redact_rects:
+            print("❌ --dir 批量模式不支持 --output / --redact-rects（这两个是单文件专用）", file=sys.stderr)
+            sys.exit(1)
+        _redact_dir(args)
+        return
+
+    if not args.file:
+        parser.print_help()
+        sys.exit(1)
+
+    _redact_one(args.file, args)
+
+
+# 批量脱敏时逐个处理的文件扩展名（与单文件模式一致）
+_BATCH_EXTS = (".pdf", ".docx", ".doc", ".zip", ".rar", ".7z")
+
+
+def _redact_dir(args):
+    """目录批量脱敏：递归找简历文件逐个处理，汇总报告。
+
+    批量模式仍 fail-closed：任一文件存在无法脱敏的命中（__UNLOCATABLE__/__BLOCKED__）
+    或格式不支持，记入失败列表，最后统一非零退出（不假装已脱敏）。
+    """
+    if not os.path.isdir(args.dir):
+        print(f"❌ 目录不存在: {args.dir}", file=sys.stderr)
+        sys.exit(1)
+
+    targets = []
+    for root, dirs, files in os.walk(args.dir):
+        # 跳过临时/缓存目录，避免误处理中间产物
+        dirs[:] = [d for d in dirs if not re.search(r"temp|临时|tmp|__pycache__", d, re.IGNORECASE)]
+        for f in sorted(files):
+            if f.lower().endswith(_BATCH_EXTS):
+                targets.append(os.path.join(root, f))
+
+    if not targets:
+        print("✅ 目录下无 pdf/docx/zip/rar 简历文件")
+        return
+
+    print(f"📂 批量脱敏 {len(targets)} 个文件：{args.dir}")
+    if args.dry_run:
+        print("⚠️ 预览模式，不改文件")
+
+    total_hits = 0
+    failed = []   # [(path, reason)]
+    for i, fp in enumerate(targets, 1):
+        print(f"\n[{i}/{len(targets)}] {'预览' if args.dry_run else '脱敏'}: {fp}")
+        try:
+            hits, modified = _run_redact(fp, args)
+        except SystemExit as e:
+            # _run_redact 内部遇到不可恢复错误会 exit，这里捕获并记录，继续处理其余文件
+            failed.append((fp, f"退出码 {e.code}"))
+            continue
+        total_hits += len(hits)
+        unlocatable = any("__UNLOCATABLE__" in str(c) or "__BLOCKED__" in str(c) for _, c in hits)
+        if unlocatable:
+            failed.append((fp, "存在无法脱敏的命中（定位不到矩形/安全阻断）"))
+        elif hits and not modified and not args.dry_run:
+            failed.append((fp, "有薪酬命中但未修改（异常）"))
+
+    print(f"\n{'=' * 40}")
+    print(f"📊 批量完成：{len(targets)} 个文件，共命中 {total_hits} 处薪酬")
+    if failed:
+        print(f"🔴 {len(failed)} 个文件需人工处理：")
+        for fp, reason in failed:
+            print(f"   - {fp}: {reason}")
+        sys.exit(2)
+    print("✅ 批量脱敏完成，可进闸门")
+
+
+def _redact_one(filepath, args):
     if not os.path.exists(filepath):
         print(f"❌ 文件不存在: {filepath}", file=sys.stderr)
         sys.exit(1)
 
-    lower = filepath.lower()
     print(f"{'预览' if args.dry_run else '脱敏'}: {filepath}")
-
-    if lower.endswith('.pdf'):
-        hits, modified = redact_pdf(filepath, args.patterns, args.dry_run)
-    elif lower.endswith('.docx'):
-        hits, modified = redact_docx(filepath, args.patterns, args.dry_run)
-    elif lower.endswith('.doc'):
-        # .doc 是老式二进制格式：antiword 只能提取文本，无法涂白矩形
-        # 扫描薪酬命中即报告并阻断（fail-closed），提示转 PDF 后脱敏
-        hits, modified = redact_doc(filepath, args.patterns, args.dry_run)
-    elif lower.endswith('.zip'):
-        hits, modified = redact_zip(filepath, args.patterns, args.dry_run)
-    elif lower.endswith(('.rar', '.7z')):
-        hits, modified = redact_rar(filepath, args.patterns, args.dry_run, args.output)
-    else:
-        print(f"❌ 不支持的格式: {filepath}", file=sys.stderr)
-        sys.exit(1)
+    hits, modified = _run_redact(filepath, args)
 
     if hits:
         print(f"\n命中 {len(hits)} 处薪酬文本：")
         for loc, ctx in hits:
             print(f"  [{loc}] ...{ctx}...")
-
         # fail-closed：有命中但未完全脱敏 → 退出非0
-        # 覆盖三种"不能假装已脱敏"的情况：
-        #   1) 命中含 __UNLOCATABLE__（定位不到矩形，涂不掉）
-        #   2) 命中含 __BLOCKED__（安全检查拒绝解压，包内简历未处理）
-        #   3) dry-run 模式（只报告不改文件）
         unlocatable = any("__UNLOCATABLE__" in str(c) or "__BLOCKED__" in str(c) for _, c in hits)
         if unlocatable:
             print(f"\n🔴 存在无法脱敏的命中（定位不到矩形/安全阻断）→ 需人工确认，文件不可直接归档",
@@ -538,8 +824,34 @@ def main():
             print(f"\n⚠️ 预览模式，未修改文件")
     else:
         print("✅ 无薪酬残留")
-
     sys.exit(0)
+
+
+def _run_redact(filepath, args):
+    """按扩展名分派脱敏，返回 (hits, modified)。单文件与批量模式共用。"""
+    lower = filepath.lower()
+
+    # 外部坐标模式（图片型 PDF 的主会话 fallback，仅单文件）
+    if args.redact_rects:
+        if not lower.endswith('.pdf'):
+            print("❌ --redact-rects 只支持 PDF", file=sys.stderr)
+            sys.exit(1)
+        return redact_pdf_rects(filepath, args.redact_rects, args.dry_run)
+
+    if lower.endswith('.pdf'):
+        return redact_pdf(filepath, args.patterns, args.dry_run)
+    if lower.endswith('.docx'):
+        return redact_docx(filepath, args.patterns, args.dry_run)
+    if lower.endswith('.doc'):
+        # .doc 是老式二进制格式：antiword 只能提取文本，无法涂白矩形
+        # 扫描薪酬命中即报告并阻断（fail-closed），提示转 PDF 后脱敏
+        return redact_doc(filepath, args.patterns, args.dry_run)
+    if lower.endswith('.zip'):
+        return redact_zip(filepath, args.patterns, args.dry_run)
+    if lower.endswith(('.rar', '.7z')):
+        return redact_rar(filepath, args.patterns, args.dry_run, args.output)
+    print(f"❌ 不支持的格式: {filepath}", file=sys.stderr)
+    sys.exit(1)
 
 
 if __name__ == '__main__':

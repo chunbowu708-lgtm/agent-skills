@@ -55,22 +55,18 @@ description: >
 
 ## 阶段1：定位简历（默认今天）
 
-```bash
-find os.environ.get("ARCHIVE_ROOT", "") -type d -name "7.01*" -path "*/已收集简历/*"
-```
-
-> 日期前缀 `7.01` 按当天改（M.DD 格式）。
-
-收集 `{岗位路径 → [简历文件]}`。**作品集**（文件名含"作品集""portfolio"）跳过分析，只评简历本体。没有新简历就告诉用户，结束。
+> 阶段1+3 已合并为一条命令（`collect_and_extract.py`），见阶段3。此处只说明「先确认有货再跑」的判断：
+> - 直接跑阶段3 的 `collect_and_extract.py --date <M.DD>`，脚本扫描不到 `{date}_*份` 目录会报「❌ 未找到」退出。
+> - 没有新简历就告诉用户，结束。
+> - **作品集**（文件名含"作品集""portfolio"的独立文件）脚本自动跳过，只提取简历本体；含简历的打包件（zip/rar）脚本自动解压，不会整包跳过。
 
 > **⛔ zip/rar 包必须解压检查内部简历（2026-08-06 铁律）**
 >
 > 教训：8.05 赵一博的简历 PDF 打包在 zip 里（和特效 mp4 作品一起），手动列文件时把整个 zip 当"作品集"跳过，导致评估报告完全漏了他。
 >
-> **规则**：遇到 `.zip/.rar` 文件，**不能整包跳过**，必须：
-> 1. 用 7z 列内容（`7z l <file>`），检查包内是否含简历文件（PDF/DOCX，文件名含"简历""resume"）
-> 2. 包内有简历 → 解压出来，对**简历文件**走 extract_text + 评估（包内作品 mp4/jpg 不评）
-> 3. 包内无简历（纯作品集）→ 确认后在文件清单标注"纯作品集，无简历"，跳过
+> **规则**：遇到 `.zip/.rar` 文件，**不能整包跳过**。阶段3 的 `collect_and_extract.py` 会自动解压并找包内简历（文件名含"简历/resume"优先），无需手动列内容；此处只强调判断原则：
+> 1. 包内有简历 → 由 collect_and_extract 提取简历文本（包内作品 mp4/jpg 不评）
+> 2. 包内无简历（纯作品集）→ collect_and_extract 会标记"纯作品集，无简历"，进兜底区
 >
 > "作品集跳过"只适用于**独立的**作品集文件（如 `xxx_作品集.pdf`），不适用于**含简历的打包件**（如 `xxx_简历加作品.zip`）。
 
@@ -99,12 +95,14 @@ python "…/analyze-resumes/scripts/collect_and_extract.py" \
 3. ZIP/RAR → **解压找包内简历**（文件名含"简历/resume"优先），提取简历文本（不会整包跳过）
 4. 图片型（JPG/PNG 或 is_valid=false 的 PDF）→ 标记"图片型，需人工看原件"，进兜底区
 5. 纯作品集（zip 内无简历文件）→ 标记"纯作品集"，不提取
+6. **BOSS 加密文本层 PDF**（2026-08-10 新增）：BOSS 直聘把 PDF 文本层替换成 hex token（如 `45e9a67e...~~`），`get_text()` 提取出的是乱码不是文字，但渲染层正常显示。`extract_text.py` 检测到 token 行占比 >60% 时自动判定为 BOSS 加密，**渲染页面为图片**（200dpi PNG），在 JSON 里返回 `render_pages: [路径...]`。主会话用视觉模型读图片内容 → 等效于"擦掉文本层看图像"，绕过 BOSS 反爬。
 
 **输出**：每个候选人的文本 JSON（到 `--output-dir`）+ stdout 清单表（姓名/工作室/岗位/状态/文本长度/来源）。
 
 **拿到清单后直接读 JSON 进阶段4分析**。清单里的"图片型"和"纯作品集"进兜底区，不硬分析。
 脚本已内置人数清点（输出汇总行），不需要手动交叉比对。
 单份简历需要 `--recovery`（多栏挽救）时，对那一份单独跑 `extract_text.py --recovery`。
+**BOSS 加密 PDF 需单独处理**：collect_and_extract 会自动渲染图片并返回 `render_pages`，但**视觉识别要主会话做**（脚本环境无 MCP 视觉工具）。主会话拿到 render_pages 路径后，用视觉模型逐页读取内容，手动写回 JSON 的 text 字段。
 
 ## 阶段4：逐份分析（主会话直接做，不派 agent）
 
@@ -154,7 +152,7 @@ python "…/analyze-resumes/scripts/collect_and_extract.py" \
 
 > 判断类反模式（沉默信号/外部信号/百分比评分/自我标榜/四维度堆砌）见 `references/analyze-prompt.md`（每次必读）。下面只列 skill 执行层独有的：
 
-- **不要自写提取脚本** — 用 `scripts/extract_text.py`（分析用，输出带质检的 JSON），for 循环批量即可。注意：`collect-resumes/scripts/content_extractors.py` 是**归档闸门用**的提取器（关注能否验证姓名/薪酬），职责不同，两者 DOCX 库不同（分析用 fitz / 闸门用 python-docx）是有意为之。
+- **不要自写提取脚本** — 用 `scripts/collect_and_extract.py` 一条命令扫描+解压+提取（阶段1+3 合并）。`scripts/extract_text.py` 只用于单份简历的 `--recovery` 挽救或 BOSS 加密 PDF 的单独渲染，不用于批量循环。注意：`collect-resumes/scripts/content_extractors.py` 是**归档闸门用**的提取器（关注能否验证姓名/薪酬），职责不同，两者 DOCX 库不同（分析用 fitz / 闸门用 python-docx）是有意为之。
 - **不要评估完不分发** — 阶段6必做，用户要的是"能直接打包发业务"的档位文件夹。
 - **不要跳过阶段7** — 评估完不发飞书=没完成。用户要的是"在飞书里看到报告"，不是"notes/ 里多一个 md"。
 - **不要碰薪资** — BOSS 收简历时已按薪酬期望筛过。
@@ -167,7 +165,7 @@ python "…/analyze-resumes/scripts/collect_and_extract.py" \
 | 文件 | 用途 |
 |---|---|
 | `scripts/collect_and_extract.py` | **阶段1+3 一键扫描+解压+提取+清点**（zip/rar 包内简历自动发现，不漏人） |
-| `scripts/extract_text.py` | 单份 PDF/docx 文本提取+质检，`--recovery` 挽救排版错乱 |
+| `scripts/extract_text.py` | 单份 PDF/docx 文本提取+质检，`--recovery` 挽救排版错乱，**BOSS 加密文本层自动渲染图片 fallback**（`--render-pages <dir>`） |
 | `references/analyze-prompt.md` | 分析维度+落档规则+行家直觉（**每次分析必读**） |
 | `references/output-template.md` | 四层产出格式（**产出时必读**） |
 | `references/publish-lark-doc.md` | 阶段7 飞书发布流程：预处理+鉴权+import+发链接（**发布时必读**） |

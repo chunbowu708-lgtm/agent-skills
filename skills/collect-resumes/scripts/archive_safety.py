@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-archive_safety.py — ZIP 归档安全检查
+archive_safety.py — ZIP 归档安全检查 + 中文文件名还原
 
 防：
   - 路径穿越（Zip Slip）：绝对路径、盘符、.. 路径
@@ -12,6 +12,9 @@ archive_safety.py — ZIP 归档安全检查
   - 未知文档格式
   - 零有效简历
   - 多候选人（业务契约：一包一人）
+
+decode_zip_name：还原 zip 内中文文件名（cp437 乱码 → utf-8 优先 → gbk 兜底），
+供 check_zip / verify_archive / redact_salary 复用（单一真相源）。
 
 任何无法完整验证的情况返回 SafetyResult(blocked=True)，
 verify_archive 不得放行。
@@ -39,6 +42,35 @@ PORTFOLIO_MEDIA_EXTS = {".mp4", ".mov", ".avi", ".mpg", ".webm", ".psd", ".ai", 
 RESUME_MEMBER_EXTS = {".pdf", ".docx", ".doc"}
 # 嵌套归档扩展名（在 ZIP 内出现 → 阻断）
 NESTED_ARCHIVE_EXTS = {".zip", ".rar", ".7z", ".tar", ".gz"}
+
+
+def decode_zip_name(info):
+    """还原 zip 内文件名（单一真相源，供 check_zip/verify_archive/redact_salary 复用）。
+
+    根因：Windows/网盘/邮箱等工具生成 zip 时，中文文件名用 UTF-8（或 GBK）字节
+    写入，但未必正确设置 0x800 UTF-8 标志位，Python zipfile 会按 cp437 解码出
+    乱码（如"游戏主美"→"µ╕╕µêÅ..."）。
+
+    策略（按顺序尝试，先成功者胜）：
+    1. 已含中文 → Python 已正确解码，直接返回
+    2. 乱码 → encode('cp437') 还原原始字节，按 utf-8 → gbk 顺序解码，先解出中文者胜
+    3. 都失败 → 返回原名（含纯 ASCII 名，如 resume.pdf）
+    """
+    name = info.filename
+    if re.search(r"[\u4e00-\u9fff]", name):
+        return name
+    try:
+        raw = name.encode("cp437")
+    except Exception:
+        return name
+    for enc in ("utf-8", "gbk"):
+        try:
+            decoded = raw.decode(enc)
+            if re.search(r"[\u4e00-\u9fff]", decoded):
+                return decoded
+        except Exception:
+            continue
+    return name
 
 
 class SafetyResult:
@@ -84,7 +116,7 @@ def check_zip(zip_path):
     total_uncompressed = 0
 
     for info in infos:
-        name = info.filename
+        name = decode_zip_name(info)  # 还原中文名后再做安全检查/记录（乱码名无法正确判扩展名）
         # 跳过目录
         if info.is_dir():
             continue

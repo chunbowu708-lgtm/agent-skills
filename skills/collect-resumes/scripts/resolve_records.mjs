@@ -85,6 +85,14 @@ export function discoverJobDirs(root) {
 }
 
 /**
+ * 岗位名归一化：去空格/横线/·/—（全角半角），用于消解"AI Native 游戏服务端" vs
+ * "AI Native游戏服务端"这类书写差异导致的漏匹配。不改变语义（不做同义词）。
+ */
+function normalizeJobName(s) {
+  return (s || '').replace(/[\s\-—·・]/g, '').toLowerCase();
+}
+
+/**
  * 按岗位名模糊匹配已发现的岗位目录。
  *
  * 匹配策略（fail-closed：疑似歧义就判 ambiguous，绝不静默选错）：
@@ -93,6 +101,9 @@ export function discoverJobDirs(root) {
  *      （2026-08-06：8.05 把游戏UI设计师误归坤灵UIUE的教训——
  *      Agent 传完整路径前缀时，绝不走模糊匹配）
  *   1. 精确匹配最后一级目录名（jobName === 末段）
+ *   1b. 归一化精确匹配（去空格/横线，2026-08-13）：
+ *       精确匹配无果时，按归一化后的末段名再精确匹配一次，消解书写差异。
+ *       仍唯一命中才生效；多个命中照样判歧义（不静默选错）。
  *   2. 精确命中后，额外检测"近义岗位"：是否存在其他目录的末段【包含 jobName 或被 jobName 包含】
  *      （如 jobName="特效设计师" 精确命中后，发现还有"Unity特效设计师"包含它 → 判歧义）
  *      近义歧义必须人工确认，因为岗位名常带引擎/方向前缀，错配=归错档。
@@ -125,7 +136,18 @@ export function matchJobDir(jobName, jobDirs) {
   }
 
   // 策略1：精确匹配最后一级目录名
-  const exact = jobDirs.filter(j => lastSegOf(j) === lower);
+  let exact = jobDirs.filter(j => lastSegOf(j) === lower);
+
+  // 策略1b：归一化精确匹配（2026-08-13）—— 消解"空格/横线"书写差异。
+  // 仅当精确匹配无果时启用；归一化命中多个仍判歧义（fail-closed）。
+  if (exact.length === 0) {
+    const normTarget = normalizeJobName(lower);
+    const normMatches = jobDirs.filter(j => normalizeJobName(lastSegOf(j)) === normTarget);
+    if (normMatches.length >= 1) {
+      exact = normMatches;
+    }
+  }
+
   if (exact.length >= 1) {
     // 近义歧义检测：精确命中后，看是否还有其他目录末段与 jobName 存在包含关系
     // （排除已精确命中的那些）。存在即疑似同岗不同细分 → fail-closed 判歧义。
@@ -256,6 +278,97 @@ export function resolveRecord(manifest, recordId, name, jobName, filename, jobDi
   return { manifest: upsertRecord(manifest, updated), status: 'resolved', detail: target };
 }
 
+// ---- 文件名自动解析（--auto 批量模式，2026-08-13 对抗式审查新增）----
+// 第一性原理：BOSS 投递简历的文件名本身就是结构化信息（【岗位_城市_薪资】姓名_年限.ext），
+// 岗位和姓名已在数据里，无需 AI 逐条人工转录。resolve 漏人 455 条积压一个月的根因就是
+// "信息在文件名里却要人工重新输入一遍"——这是最典型的重复造轮子。
+// 自动解析只在"唯一匹配 + 精确提取"时才落盘，歧义/失败一律保留 needs_resolution 报告出来，
+// 绝不静默猜错（与 matchJobDir 的 fail-closed 一致）。
+
+// BOSS 投递标题：【岗位_城市_薪资】姓名_年限.pdf 或 作品集-【岗位_城市_薪资】姓名_年限.pdf
+const BOSS_TITLE_RE = /【(.+?)】\s*([^\s_\-—]+?)(?:[_\-—]\d+年|[_\-—]一年以内|[_\-—]应届|[_\-—]不限|[_\-—]N年)?\.(pdf|docx|doc|zip|rar|7z|png|jpg|jpeg)$/i;
+
+/**
+ * 从 original_filename 自动提取 { job, name }。
+ * 返回 null 表示无法可靠提取（含"作品集-"前缀也能提取，但年限/岗位/姓名必须齐全）。
+ */
+export function parseNameJobFromFilename(filename) {
+  if (!filename) return null;
+  const fn = filename.trim();
+  const m = BOSS_TITLE_RE.exec(fn);
+  if (!m) return null;
+  const job = m[1].split('_')[0].trim();  // 岗位名取第一个 _ 前（去掉城市/薪资）
+  const name = m[2].trim();
+  if (!job || !name) return null;
+  // 姓名必须是纯中文（2-4 字），排除误提取到数字/英文/乱码
+  if (!/^[\u4e00-\u9fff]{2,4}$/.test(name)) return null;
+  if (!/[\u4e00-\u9fff]/.test(job)) return null;  // 岗位必须含中文
+  return { job, name };
+}
+
+/**
+ * 从 original_filename 派生规范目标文件名（姓名_岗位_年限.ext）。
+ * 仅在能同时解析出姓名+岗位时返回；否则返回 null（需人工给 filename）。
+ */
+export function deriveTargetFilename(filename, name, job) {
+  if (!filename) return null;
+  const extMatch = /\.(pdf|docx|doc|zip|rar|7z|png|jpg|jpeg)$/i.exec(filename);
+  if (!extMatch) return null;
+  // 从原文件名提取年限（如"13年""一年以内""应届"）
+  const yearMatch = /(?:[_\-—])(\d+年|一年以内|应届|不限)(?:\.|$)/.exec(filename);
+  const year = yearMatch ? yearMatch[1] : '';
+  const safeJob = job.replace(/[\\/:*?"<>|]/g, '').replace(/[\s]/g, '');
+  const base = `${name}_${safeJob}`;
+  return `${base}${year ? '_' + year : ''}.${extMatch[1].toLowerCase()}`;
+}
+
+/**
+ * --auto 批量自动解析：扫所有 needs_resolution 的 mail_attachment 记录，
+ * 从文件名自动提取岗位+姓名 → matchJobDir 唯一匹配才 resolve，否则保留报告。
+ *
+ * @returns {{ manifest, resolved: number, ambiguous: number, skipped: number, failures: [{id, name, reason}] }}
+ */
+export function autoResolve(manifest, opts = {}) {
+  const dirs = discoverJobDirs();
+  const records = Object.values(manifest.records || {});
+  const candidates = records.filter(r => r.status === 'needs_resolution' && r.source_type === 'mail_attachment' && r.original_filename);
+
+  let resolved = 0, ambiguous = 0, skipped = 0;
+  const failures = [];
+
+  for (const rec of candidates) {
+    const parsed = parseNameJobFromFilename(rec.original_filename);
+    if (!parsed) {
+      // 文件名不可靠提取（如 860ca9.jpg / 学历证书 / IMG_0386.PNG）→ 保留，人工处理
+      skipped++;
+      failures.push({ id: rec.record_id, name: rec.original_filename, reason: '文件名无法可靠提取岗位+姓名' });
+      continue;
+    }
+    const filename = deriveTargetFilename(rec.original_filename, parsed.name, parsed.job);
+    if (!filename) {
+      skipped++;
+      failures.push({ id: rec.record_id, name: rec.original_filename, reason: '无法派生规范文件名' });
+      continue;
+    }
+    // 复用 resolveRecord 的完整逻辑（去重/歧义/路径逃逸/唯一匹配）
+    const result = resolveRecord(manifest, rec.record_id, parsed.name, parsed.job, filename, dirs, { date: opts.date });
+    manifest = result.manifest;
+    if (result.status === 'resolved') {
+      resolved++;
+    } else if (result.status === 'duplicate') {
+      skipped++;  // 重复投递，正常跳过
+    } else if (result.status === 'ambiguous') {
+      ambiguous++;
+      failures.push({ id: rec.record_id, name: parsed.name, reason: `岗位"${parsed.job}"匹配多个目录，需人工确认` });
+    } else {
+      // not_found / bad_record
+      skipped++;
+      failures.push({ id: rec.record_id, name: parsed.name, reason: result.detail });
+    }
+  }
+  return { manifest, resolved, ambiguous, skipped, failures };
+}
+
 // CLI 入口
 function main() {
   const args = process.argv.slice(2);
@@ -265,9 +378,31 @@ function main() {
   const jobName = getArg(args, '--job');
   const filename = getArg(args, '--filename');
   const date = getArg(args, '--date');
+  const auto = args.includes('--auto');
+  const dryRun = args.includes('--dry-run');
+
+  if (auto) {
+    const manifest = readManifest(manifestPath);
+    const result = autoResolve(manifest, { date });
+    console.log(`\n==== 自动解析完成: ✅ ${result.resolved} 条 · ⚠️ 歧义 ${result.ambiguous} 条 · ⏭️ 跳过 ${result.skipped} 条 ====`);
+    if (result.failures.length) {
+      console.log(`\n需人工处理的 ${result.failures.length} 条（保留 needs_resolution）:`);
+      for (const f of result.failures) {
+        console.log(`  - ${f.name}: ${f.reason}`);
+      }
+    }
+    if (!dryRun) {
+      writeManifestAtomic(manifestPath, result.manifest);
+      console.log(`\n已写入 manifest（${result.resolved} 条推进到 verified，待下载）`);
+    } else {
+      console.log(`\n[DRY-RUN] 未写盘。去掉 --dry-run 正式执行。`);
+    }
+    return;
+  }
 
   if (!recordId || !name || !jobName || !filename) {
     console.error('用法: resolve_records.mjs --record <id> --name <姓名> --job <岗位> --filename <文件名> [--manifest <path>] [--date 7.29]');
+    console.error('      resolve_records.mjs --auto [--manifest <path>] [--date 7.29] [--dry-run]   # 批量自动解析（从文件名提取岗位+姓名）');
     process.exit(1);
   }
 

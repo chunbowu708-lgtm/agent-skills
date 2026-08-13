@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """简历文本提取 + 质检。
 
-用法：python extract_text.py <简历文件路径>
-输出：stdout 一行 JSON：{"text": ..., "char_count": N, "is_valid": bool, "issue": str|null}
+用法：python extract_text.py <简历文件路径> [--recovery] [--render-pages <dir>]
+输出：stdout 一行 JSON：{"text": ..., "char_count": N, "is_valid": bool, "issue": str|null, ...}
 
 支持 PDF 和 DOCX，统一用 fitz（PyMuPDF）提取。
 fitz 能读出 docx 里的文本框内容，比 python-docx 更可靠。
@@ -11,14 +11,24 @@ fitz 能读出 docx 里的文本框内容，比 python-docx 更可靠。
 - 字数 < 200 → 文本异常（疑似扫描件/图片PDF）
 - 非可读字符占比 > 25% → 文本异常（疑似编码损坏）
 - 有效行占比 < 50% → 文本异常（疑似多栏/竖排版式解析错乱）
+- BOSS 加密文本层（token 行占比高）→ 文本异常（需渲染图片走视觉识别）
 
-第三条最关键：有些 PDF 字符够、也不是乱码，但多栏排版被 fitz
-按列打散、行序错乱，拼出来读不通。有效行占比能抓住这类"字符够
-但顺序碎了"的情况（正常简历 85%+，排版错乱的 20-30%）。
+最后一条是 BOSS 直聘的反爬处理：PDF 渲染层正常显示（人眼看没问题），
+但文本层被替换成 hex token（如 45e9a67e755836a71HN53tS_...~~），
+get_text() 提取出的是 token 不是真实文字。检测到这种 PDF 时：
+  - 自动把页面渲染成图片（--render-pages 指定输出目录，或用临时目录）
+  - JSON 里返回 render_pages: [图片路径...]，调用方（主会话/上层脚本）
+    用视觉模型读图片内容
+  - 这等效于"擦掉文本层看图像"，绕过 BOSS 的文本层加密
+
+渲染 fallback 只渲染图片落盘，不调视觉模型——模型依赖外部 MCP 工具，
+脚本环境里没有。脚本的职责是"渲染好图片告诉调用方去识别"。
 """
 import json
+import os
 import re
 import sys
+import tempfile
 
 import fitz  # PyMuPDF
 
@@ -26,8 +36,14 @@ import fitz  # PyMuPDF
 MIN_CHARS = 200
 # 非可读字符占比上限：超过判定为文本异常（疑似编码损坏）
 MAX_JUNK_RATIO = 0.25
-# 有效行占比下限：低于判定为文本异常（疑似多栏/竖排解析错乱）
+# 有效行占比下限：低于判定为文本异常（疑似多栏/竖排版式解析错乱）
 MIN_VALID_LINE_RATIO = 0.50
+# BOSS token 行占比上限：超过判定为 BOSS 加密文本层
+# token 行 = 无中文 + (连续8位hex前缀 或 含~~)
+# BOSS 简历约 84% 行是 token，正常简历 0%，设 60% 留余量
+MAX_TOKEN_LINE_RATIO = 0.60
+# 渲染图片的 DPI（200 足够视觉模型识别，文件不过大）
+RENDER_DPI = 200
 
 # 可读字符：中文、英文、数字、常见标点、空格换行
 _READABLE_RE = re.compile(
@@ -41,6 +57,23 @@ _READABLE_RE = re.compile(
 # 有效行：含>=2个中文字符，或含长度>=4的连续英文字母词
 # 用来检测多栏/竖排版式被 fitz 打散后的"碎片行"过多
 _VALID_LINE_RE = re.compile(r"[\u4e00-\u9fff]{2,}|[a-zA-Z]{4,}")
+
+# BOSS token 行：无中文 + (连续8位hex前缀 或 含~~结尾符)
+# 实测 BOSS 简历 token 形如：45e9a67e755836a71HN53tS_ElRXw4S3VfKeWOGhnPfVNBJl3w~~
+_TOKEN_LINE_RE = re.compile(r"^[0-9a-f]{8,}")
+_TOKEN_TAIL = "~~"
+
+
+def _is_token_line(line):
+    """判断一行是否是 BOSS 加密文本层的 token 行。
+
+    BOSS 把 PDF 文本层替换成内部 ID token，特征：
+    - 无中文字符
+    - 以 8 位以上连续 hex (0-9a-f) 开头，或含 ~~ 结尾符
+    """
+    if re.search(r"[\u4e00-\u9fff]", line):  # 有中文 → 不是 token
+        return False
+    return bool(_TOKEN_LINE_RE.search(line)) or _TOKEN_TAIL in line
 
 
 def extract(path):
@@ -69,7 +102,38 @@ def extract(path):
         if valid_line_ratio < MIN_VALID_LINE_RATIO:
             return text, False, f"排版解析错乱（有效行仅{valid_line_ratio:.0%}），疑似多栏/竖排，需人工看原文件"
 
+    # 质检3：BOSS 加密文本层（token 行占比过高）
+    # 必须在有效行检测之后——否则 token 行含连续英文字母会先把 valid_line_ratio 拉高
+    # 通过前两条质检但全是 token 的情况，在这里拦住
+    if lines:
+        token_lines = sum(1 for l in lines if _is_token_line(l))
+        token_line_ratio = token_lines / len(lines)
+        if token_line_ratio > MAX_TOKEN_LINE_RATIO:
+            return text, False, f"BOSS加密文本层（token行占{token_line_ratio:.0%}），需渲染图片走视觉识别"
+
     return text, True, None
+
+
+def render_pages(pdf_path, output_dir=None, dpi=RENDER_DPI):
+    """把 PDF 每页渲染成 PNG 图片（绕过 BOSS 文本层加密的 fallback）。
+
+    返回图片路径列表。output_dir 不传时用临时目录。
+    图片命名：p{页码}.png（1-based）。
+    """
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    else:
+        output_dir = tempfile.mkdtemp(prefix="_extract_render_")
+
+    doc = fitz.open(pdf_path)
+    paths = []
+    for i, page in enumerate(doc):
+        pix = page.get_pixmap(dpi=dpi)
+        fp = os.path.join(output_dir, f"p{i+1}.png")
+        pix.save(fp)
+        paths.append(fp)
+    doc.close()
+    return paths
 
 
 def extract_recovery(path):
@@ -95,11 +159,17 @@ def extract_recovery(path):
 
 def main():
     if len(sys.argv) < 2:
-        print(json.dumps({"error": "用法：python extract_text.py <简历文件路径> [--recovery]"}), file=sys.stderr)
+        print(json.dumps({"error": "用法：python extract_text.py <简历文件路径> [--recovery] [--render-pages <dir>]"}), file=sys.stderr)
         sys.exit(2)
 
     path = sys.argv[1]
     use_recovery = "--recovery" in sys.argv[2:]
+
+    # --render-pages <dir>：渲染图片到指定目录（不传则用临时目录）
+    render_dir = None
+    if "--render-pages" in sys.argv[2:]:
+        idx = sys.argv.index("--render-pages")
+        render_dir = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else None
 
     try:
         if use_recovery:
@@ -109,12 +179,41 @@ def main():
         else:
             text, is_valid, issue = extract(path)
             result = {"text": text, "char_count": len(text), "is_valid": is_valid, "issue": issue}
+
+            # 自动渲染 fallback：文本不可读（含 BOSS token 层）时，渲染图片供视觉识别
+            # 调用方（主会话/collect_and_extract）读 render_pages 字段，
+            # 把图片喂给视觉模型——等效于"擦掉文本层看图像"
+            if not is_valid and _needs_render(issue):
+                try:
+                    paths = render_pages(path, render_dir)
+                    result["render_pages"] = paths
+                    result["render_fallback"] = True
+                    # issue 追加提示，让调用方知道有图片可用
+                    result["issue"] = issue + f"，已渲染{len(paths)}页图片到{'指定目录' if render_dir else '临时目录'}，用视觉模型读取"
+                except Exception as e:
+                    result["render_error"] = str(e)
+
     except Exception as e:
         print(json.dumps({"error": f"提取失败：{e}"}), file=sys.stderr)
         sys.exit(1)
 
     # stdout 输出 JSON（纯 ASCII 安全，ensure_ascii=True 把中文转 \uXXXX）
     print(json.dumps(result, ensure_ascii=True))
+
+
+def _needs_render(issue):
+    """判断该 issue 是否值得渲染图片 fallback。
+
+    只有"文本层坏了但渲染层可能正常"的情况才渲染：
+    - BOSS 加密文本层（token 行）：渲染层正常，渲染必有用
+    - 文本过少（扫描件/图片PDF）：渲染层可能就是图片，渲染有用
+    - 排版解析错乱：渲染层正常，但视觉模型读多栏排版也可能错，价值有限
+      → 不渲染（recovery 模式更合适）
+    - 乱码占比过高（编码损坏）：渲染层可能也坏，不渲染
+    """
+    if not issue:
+        return False
+    return "BOSS" in issue or "扫描件" in issue or "图片PDF" in issue
 
 
 if __name__ == "__main__":

@@ -6,11 +6,13 @@
   1. markdown 表格：日期 | 空闲时段 | 备注（自动生成"最宽裕/时段零碎/周末"等备注）
   2. 可排档位列表（默认 45 分钟/场切档，只列未来档位）
   3. --svg <path>：生成时间轴色段图（SVG），空闲绿/会议红/午休灰/已过与周末半透明
+  4. --html <path>：生成 HTML 色段条（div 布局）——**对话内联展示用这个**（2026-08-07 起：内联 SVG 在部分渲染端降级成文本树、色块全丢，HTML div 任何端都能画）
 
 用法：
   python show_availability.py --interviewer 古振兴
   python show_availability.py --interviewer 谢坤,潘腾飞 --duration 60     # 多人：每人 + 共同档位
   python show_availability.py --interviewer 古振兴 --svg out.svg        # 同时生成色段图
+  python show_availability.py --interviewer 古振兴 --html out.html      # 生成 HTML 色段条（对话内联推荐）
   python show_availability.py --interviewer 古振兴 --start 2026-08-05 --days 3
   python show_availability.py --interviewer 古振兴 --work-start 10:00 --work-end 20:00  # 晚上面试
   python show_availability.py --interviewer 古振兴 --past               # 连已过档位一起列
@@ -94,7 +96,7 @@ def build_svg(title, subtitle, days_info, ws_h, we_h, today, now, duration, out_
 
     parts = []
     parts.append(f'<svg viewBox="0 0 680 {H}" width="100%" xmlns="http://www.w3.org/2000/svg" role="img" font-family="var(--font-sans)">')
-    parts.append(f"<title>{title} 可约时段</title>")
+    parts.append(f"<title>{title}</title>")
     parts.append("<desc>面试官可约时段色段图：绿=空闲可约，红=已有会议，灰=午休，半透明=已过/周末</desc>")
     parts.append(f'<text x="40" y="24" font-size="15" font-weight="500" fill="#2C2C2A">{title}</text>')
     parts.append(f'<text x="40" y="42" font-size="12" fill="#5F5E5A">{subtitle}</text>')
@@ -172,6 +174,78 @@ def build_svg(title, subtitle, days_info, ws_h, we_h, today, now, duration, out_
     return out_path
 
 
+def build_html(title, subtitle, days_info, ws_h, we_h, today, now, duration, out_path):
+    """生成 HTML 色段条（div 布局，浅色主题，对话内联展示用）。
+    与 build_svg 同一数据源同一配色：绿=空闲 #9FE1CB / 红=会议 #F7C1C1 / 灰=午休 #D3D1C7。
+    days_info 同 build_svg。
+    """
+    hours = we_h - ws_h
+
+    def pct(dt):
+        return (dt.hour + dt.minute / 60 - ws_h) / hours * 100
+
+    parts = []
+    parts.append('<div style="font-family:var(--font-sans);color:#2C2C2A;max-width:680px">')
+    parts.append(f'<div style="font-size:15px;font-weight:500">{title}</div>')
+    parts.append(f'<div style="font-size:12px;color:#5F5E5A;margin:2px 0 8px">{subtitle}</div>')
+    parts.append(
+        '<div style="display:flex;gap:14px;font-size:12px;color:#444441;margin-bottom:8px">'
+        '<span style="display:flex;align-items:center;gap:4px"><span style="width:14px;height:14px;border-radius:2px;background:#9FE1CB;display:inline-block"></span>空闲可约</span>'
+        '<span style="display:flex;align-items:center;gap:4px"><span style="width:14px;height:14px;border-radius:2px;background:#F7C1C1;display:inline-block"></span>已有会议</span>'
+        '<span style="display:flex;align-items:center;gap:4px"><span style="width:14px;height:14px;border-radius:2px;background:#D3D1C7;display:inline-block"></span>午休</span>'
+        '<span style="color:#888780">半透明 = 已过 / 周末</span></div>')
+    now_pct = pct(now) if today.weekday() < 5 else None
+    for label, _, _, data in days_info:
+        day = data["date"]
+        past = day < today
+        weekend = day.weekday() >= 5
+        day_s = datetime.datetime(day.year, day.month, day.day, ws_h, 0, tzinfo=TZ)
+        day_e = datetime.datetime(day.year, day.month, day.day, we_h, 0, tzinfo=TZ)
+
+        def blk(s, e, color):
+            ss, ee = max(s, day_s), min(e, day_e)
+            if ee <= ss:
+                return ""
+            o = "0.45" if (past or weekend or (day == today and ee <= now)) else "1"
+            return (f'<div style="position:absolute;left:{pct(ss):.2f}%;width:{max(0.4, pct(ee)-pct(ss)):.2f}%;'
+                    f'top:0;bottom:0;background:{color};opacity:{o};border-radius:2px"></div>')
+
+        row = ('<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">'
+               f'<div style="width:86px;text-align:right;font-size:13px;font-weight:500;flex-shrink:0">{label}</div>'
+               '<div style="flex:1;height:28px;border-radius:4px;background:#F1EFE8;position:relative;overflow:hidden">')
+        lunch_s = datetime.datetime(day.year, day.month, day.day, 12, 0, tzinfo=TZ)
+        lunch_e = datetime.datetime(day.year, day.month, day.day, 13, 30, tzinfo=TZ)
+        row += blk(lunch_s, lunch_e, "#D3D1C7")
+        for s, e in data.get("free", []):
+            row += blk(s, e, "#9FE1CB")
+        for s, e in data.get("busy", []):
+            row += blk(s, e, "#F7C1C1")
+        if day == today and now_pct is not None and 0 < now_pct < 100:
+            row += (f'<div style="position:absolute;left:{now_pct:.2f}%;top:0;bottom:0;width:1px;'
+                    f'background:#5F5E5A;opacity:0.75"></div>')
+        row += '</div>'
+        right = ("已过" if past else ("周末" if weekend else ""))
+        row += (f'<div style="width:34px;font-size:11px;color:{"#A32D2D" if past else "#888780"};'
+                f'flex-shrink:0;text-align:right">{right}</div>')
+        row += '</div>'
+        parts.append(row)
+    # 时间轴
+    axis = ('<div style="margin-left:96px;position:relative;height:18px;margin-top:2px">'
+            '<div style="position:absolute;left:0;right:0;top:6px;border-top:0.5px solid #D3D1C7"></div>')
+    for h in range(ws_h, we_h + 1):
+        p = (h - ws_h) / hours * 100
+        tr = "translateX(0)" if h == ws_h else ("translateX(-100%)" if h == we_h else "translateX(-50%)")
+        axis += (f'<span style="position:absolute;left:{p:.2f}%;transform:{tr};'
+                 f'top:9px;font-size:11px;color:#888780">{h}:00</span>')
+    axis += '</div>'
+    parts.append(axis)
+    parts.append('</div>')
+    html = "\n".join(parts)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return out_path
+
+
 def main():
     ap = argparse.ArgumentParser(description="展示面试官可约时段（表格 + 档位 + 色段图）")
     ap.add_argument("--interviewer", required=True, help="面试官姓名，逗号分隔")
@@ -182,6 +256,7 @@ def main():
     ap.add_argument("--work-end", default="18:00", help="工作结束，默认 18:00")
     ap.add_argument("--past", action="store_true", help="连已过档位一起列出")
     ap.add_argument("--svg", default="", help="生成色段图 SVG 文件路径（如 availability.svg）")
+    ap.add_argument("--html", default="", help="生成 HTML 色段条文件路径（对话内联推荐，如 availability.html）")
     args = ap.parse_args()
 
     ws_h, ws_m = parse_hhmm(args.work_start)
@@ -293,6 +368,14 @@ def main():
                     f"半透明色块 = 已过时段 / 周末 · {args.duration}分钟/场切档")
         out = build_svg(title, subtitle, days_info, ws_h, we_h, today, now, args.duration, args.svg)
         print(f"\n[✅] 色段图已生成: {out}")
+
+    # HTML 色段条（对话内联展示推荐，2026-08-07 起取代内联 SVG）
+    if args.html:
+        title = f"{'、'.join(labels)} 可约时段"
+        subtitle = (f"工作时段 {args.work_start}-{args.work_end} · 已排除午休 12:00-13:30 · "
+                    f"半透明色块 = 已过时段 / 周末 · {args.duration}分钟/场切档")
+        out = build_html(title, subtitle, days_info, ws_h, we_h, today, now, args.duration, args.html)
+        print(f"\n[✅] 色段图(HTML)已生成: {out}")
 
 
 if __name__ == "__main__":

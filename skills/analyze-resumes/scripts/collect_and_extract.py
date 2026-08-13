@@ -38,6 +38,7 @@ import shutil
 # 复用 extract_text 的提取+质检逻辑
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from extract_text import extract as extract_pdf
+from extract_text import render_pages
 
 # ---- 配置 ----
 ARCHIVE_ROOT_DEFAULT = os.environ.get("ARCHIVE_ROOT", "")
@@ -51,6 +52,29 @@ ARCHIVE_EXTS = {".zip", ".rar", ".7z"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 # "作品集"关键词（独立作品集文件跳过，但打包件内的简历不跳过）
 PORTFOLIO_KEYWORDS = {"作品集", "portfolio", "作品"}
+
+
+def _zip_decode_name(info):
+    """还原 zip 内中文文件名（与 collect-resumes/archive_safety.decode_zip_name 同逻辑）。
+
+    网盘/邮箱/Windows 工具生成 zip 时中文名用 UTF-8/GBK 字节写入但未必设 0x800 标志，
+    Python zipfile 按 cp437 解出乱码。这里含中文直接用，否则 cp437 还原字节 → utf-8 → gbk。
+    """
+    name = info.filename
+    if re.search(r"[\u4e00-\u9fff]", name):
+        return name
+    try:
+        raw = name.encode("cp437")
+    except Exception:
+        return name
+    for enc in ("utf-8", "gbk"):
+        try:
+            decoded = raw.decode(enc)
+            if re.search(r"[\u4e00-\u9fff]", decoded):
+                return decoded
+        except Exception:
+            continue
+    return name
 
 
 def find_date_dirs(archive_root, date_prefix):
@@ -82,7 +106,15 @@ def find_resume_in_archive(archive_path, extract_dir):
     if ext == ".zip":
         try:
             with zipfile.ZipFile(archive_path) as zf:
-                zf.extractall(extract_dir)
+                # 还原中文名后手动落盘，避免 extractall 把 cp437 乱码名写进磁盘
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    real_name = _zip_decode_name(info)
+                    target = os.path.join(extract_dir, real_name.replace("\\", "/"))
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with zf.open(info) as src, open(target, 'wb') as dst:
+                        dst.write(src.read())
         except Exception:
             return [], []
     elif ext in (".rar", ".7z"):
@@ -114,17 +146,29 @@ def find_resume_in_archive(archive_path, extract_dir):
 
 
 def extract_resume_text(filepath):
-    """提取简历文本，返回 (text, is_valid, issue)。"""
+    """提取简历文本，返回 (text, is_valid, issue, render_pages)。
+
+    render_pages：当文本不可读（BOSS加密文本层/扫描件）时，自动渲染
+    PDF 页面为图片，返回路径列表供调用方做视觉识别。正常时为 None。
+    """
     ext = os.path.splitext(filepath)[1].lower()
     if ext == ".pdf":
-        return extract_pdf(filepath)
+        text, is_valid, issue = extract_pdf(filepath)
+        render = None
+        if not is_valid and issue and ("BOSS" in issue or "扫描件" in issue or "图片PDF" in issue):
+            try:
+                render = render_pages(filepath)
+            except Exception:
+                render = None
+        return text, is_valid, issue, render
     elif ext in (".docx", ".doc"):
         # fitz 也能读 docx
         try:
-            return extract_pdf(filepath)
+            text, is_valid, issue = extract_pdf(filepath)
+            return text, is_valid, issue, None
         except Exception:
-            return "", False, "DOCX 提取失败"
-    return "", False, f"不支持的格式: {ext}"
+            return "", False, "DOCX 提取失败", None
+    return "", False, f"不支持的格式: {ext}", None
 
 
 def parse_name_from_dir(date_dir):
@@ -196,19 +240,26 @@ def main():
                 if ext in RESUME_EXTS:
                     # 独立简历文件
                     if is_resume_file(f):
-                        text, is_valid, issue = extract_resume_text(filepath)
+                        text, is_valid, issue, render = extract_resume_text(filepath)
+                        # BOSS 加密文本层：渲染了图片，status 标注提示用视觉识别
+                        status = "✅已提取" if is_valid else ("🖼️BOSS加密(已渲染图片)" if render else "⚪图片型/异常")
                         key = f"{name_base}_{job}"
                         if key not in candidates:
                             candidates[key] = {
                                 "name": name_base, "studio": studio, "job": job,
-                                "status": "✅已提取" if is_valid else "⚪图片型/异常",
+                                "status": status,
                                 "issue": issue, "text_len": len(text),
                                 "source": f, "text": text if is_valid else "",
+                                "render_pages": render,
                             }
                             # 保存 JSON
                             json_path = os.path.join(output_dir, f"{name_base}.json")
                             with open(json_path, "w", encoding="utf-8") as jf:
-                                json.dump({"text": text, "is_valid": is_valid, "issue": issue}, jf, ensure_ascii=False)
+                                out = {"text": text, "is_valid": is_valid, "issue": issue}
+                                if render:
+                                    out["render_pages"] = render
+                                    out["render_fallback"] = True
+                                json.dump(out, jf, ensure_ascii=False)
                     # 独立作品集文件 → 跳过（不计入）
                     continue
 
@@ -221,19 +272,25 @@ def main():
                             # 优先取 "resume" 类型，其次 "maybe"
                             resumes.sort(key=lambda x: 0 if x[0] == "resume" else 1)
                             resume_type, resume_path, resume_name = resumes[0]
-                            text, is_valid, issue = extract_resume_text(resume_path)
+                            text, is_valid, issue, render = extract_resume_text(resume_path)
+                            status = "✅已提取(zip内)" if is_valid else ("🖼️BOSS加密(zip内,已渲染图片)" if render else "⚪图片型/异常(zip内)")
                             key = f"{name_base}_{job}"
                             if key not in candidates:
                                 candidates[key] = {
                                     "name": name_base, "studio": studio, "job": job,
-                                    "status": "✅已提取(zip内)" if is_valid else "⚪图片型/异常(zip内)",
+                                    "status": status,
                                     "issue": issue, "text_len": len(text),
                                     "source": f"{f} → {resume_name}",
                                     "text": text if is_valid else "",
+                                    "render_pages": render,
                                 }
                                 json_path = os.path.join(output_dir, f"{name_base}.json")
                                 with open(json_path, "w", encoding="utf-8") as jf:
-                                    json.dump({"text": text, "is_valid": is_valid, "issue": issue}, jf, ensure_ascii=False)
+                                    out = {"text": text, "is_valid": is_valid, "issue": issue}
+                                    if render:
+                                        out["render_pages"] = render
+                                        out["render_fallback"] = True
+                                    json.dump(out, jf, ensure_ascii=False)
                         else:
                             # 包内无简历 → 纯作品集
                             key = f"{name_base}_{job}"

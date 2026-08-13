@@ -24,6 +24,9 @@ match_schedule.py — 面试时间协调核心脚本
   # 候选人给精确时段
   python match_schedule.py --interviewer 谢坤 --candidates "罗艺=周四 16:00" --duration 60
 
+  # per-candidate 形式覆盖（2026-08-12 新增）：同面试官跨形式合并跑
+  python match_schedule.py --interviewer 金海 --candidates "范亚军=8-14上午#线下,谢大文=8-13 20:00#视频" --work-end 21
+
   # 自定义工作时间范围
   python match_schedule.py --interviewer 谢坤 --candidates "罗艺=周四" --duration 45 --work-start 10:00 --work-end 19:00
 """
@@ -493,7 +496,9 @@ def get_freebusy_blocks(oids, start_iso, end_iso, labels=None):
     # 每个人反推空闲，存每人的空闲段集合；同时收集真实忙碌段（带姓名归属）
     per_person_free = []
     real_busy = []  # [(start, end, who_label)] 真实会议，不含午休
-    for oid, label in zip(oids, labels):
+
+    def _fetch_one(oid, label):
+        """单人 freebusy 查询（2026-08-12 并行化：多面试官时逐人 subprocess 改为并发）"""
         data = run_lark([
             "calendar", "+freebusy",
             "--user-id", oid,
@@ -501,7 +506,6 @@ def get_freebusy_blocks(oids, start_iso, end_iso, labels=None):
             "--end", end_iso,
             "--format", "json",
         ])
-        # freebusy 返回平铺数组（非 data 下），兼容两种结构
         items = data.get("data", [])
         if items is None:
             items = []
@@ -516,11 +520,23 @@ def get_freebusy_blocks(oids, start_iso, end_iso, labels=None):
             bs = _parse_iso(it["start_time"])
             be = _parse_iso(it["end_time"])
             busy.append((bs, be))
+        return label, oid, busy, len(items)
+
+    # 并行查多面试官 freebusy（2026-08-12：串行 → ThreadPool 并发）
+    if len(oids) == 1:
+        fetched = [_fetch_one(oids[0], labels[0])]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(6, len(oids))) as ex:
+            fetched = list(ex.map(lambda args_: _fetch_one(*args_), zip(oids, labels)))
+
+    for label, oid, busy_items, n_items in fetched:
+        for bs, be in busy_items:
             real_busy.append((bs, be, label))
-        busy.extend(lunch_busy)  # 午休当忙碌排除（但只在反推用，不进 real_busy）
+        busy = busy_items + list(lunch_busy)  # 午休当忙碌排除（但只在反推用，不进 real_busy）
         free = _subtract_busy(window_start, window_end, busy)
         per_person_free.append(free)
-        print(f"  {label}({oid[:12]}...) 忙碌 {len(items)} 段，反推空闲 {len(free)} 段")
+        print(f"  {label}({oid[:12]}...) 忙碌 {n_items} 段，反推空闲 {len(free)} 段")
 
     # 多人取交集（单人直接用）
     if len(per_person_free) == 1:
@@ -703,17 +719,30 @@ def list_all_rooms(force_refresh=False):
         return []
 
 
-def room_busy(start_iso, end_iso, room_id, tok):
+def room_busy(start_iso, end_iso, room_id):
     """查单间会议室忙闲（calendar/v4/freebusy/list，room_id 参数）。
-    返回 True=忙（有占用），False=空闲。
+    返回 (busy, failed)：
+      busy   = True=忙（有占用），False=空闲
+      failed = True=查询失败（已重试 1 次仍失败）——调用方须按忙处理（fail-closed）
+    **2026-08-07 大修（挖出假校验）**：
+      ① fail-open→fail-closed：原"查询失败按空闲"把失败房当可用（会议室校验是幻觉）
+      ② token 换源：原用 get_hire_token()（招聘应用 tenant token）调 calendar/v4/freebusy/list
+         → 400 code=99991672 无 calendar:free_busy 权限 → 永远失败 → fail-open 掩盖成"全可用"。
+         改用 lark-cli api(identity='user')（用户授权，日历域已开通，面试官 freebusy 同源）才是真校验。
     """
-    try:
-        d = api("POST", "/open-apis/calendar/v4/freebusy/list",
-                data={"time_min": start_iso, "time_max": end_iso, "room_id": room_id})
-        busy = (d.get("data") or {}).get("freebusy_list", []) or []
-        return len(busy) > 0
-    except Exception:
-        return False
+    for _ in (1, 2):  # 重试 1 次
+        try:
+            d = _lark_api("POST", "/open-apis/calendar/v4/freebusy/list", identity="user",
+                          data={"time_min": start_iso, "time_max": end_iso, "room_id": room_id}, timeout=30)
+            # ⚠️ lark-cli 封装返回 {ok: bool, data/error}，没有原生 code 字段！
+            # 用 d.get("code") != 0 判断会永远判失败（None != 0）→ 全房 failed（2026-08-07 实测踩坑）
+            if d is None or d.get("ok") is not True:
+                continue
+            busy = d.get("data", {}).get("freebusy_list", []) or []
+            return len(busy) > 0, False
+        except Exception:
+            continue
+    return True, True  # 两次失败 → fail-closed：按忙处理并上报 failed
 
 
 def find_rooms(start_iso, end_iso, min_capacity=0, room_name="", building="", floor="", as_user=True):
@@ -753,9 +782,9 @@ def find_rooms(start_iso, end_iso, min_capacity=0, room_name="", building="", fl
         except Exception as e:
             return False, [], f"解析失败: {e}"
 
-    # 主路径：全量枚举 + 逐间查忙闲
-
-    avail = []
+    # 主路径：全量枚举 + 并发查忙闲（2026-08-07：串行→ThreadPool 并发 max_workers=5，
+    # 失败重试1次 + fail-closed；token 走 lark-cli user 身份，见 room_busy 注释）
+    filtered = []
     for rm in all_rooms:
         # 容量筛选
         if min_capacity and min_capacity > 0 and (rm.get("capacity") or 0) < min_capacity:
@@ -768,13 +797,69 @@ def find_rooms(start_iso, end_iso, min_capacity=0, room_name="", building="", fl
             continue
         if floor and floor not in (rm.get("room_name") or ""):
             continue
-        if room_busy(start_iso, end_iso, rm["room_id"]):
-            continue  # 该时段忙，跳过
-        avail.append(rm)
+        filtered.append(rm)
+
+    avail = []
+    fail_n = 0
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _check(rm):
+        busy, failed = room_busy(start_iso, end_iso, rm["room_id"])
+        return rm, busy, failed
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        for rm, busy, failed in ex.map(_check, filtered):
+            if failed:
+                fail_n += 1
+                continue  # fail-closed：查询失败按忙，不报可用
+            if busy:
+                continue
+            avail.append(rm)
+    if fail_n:
+        print(f"[⚠️ 会议室] {fail_n} 间查询失败已按忙处理（fail-closed，宁缺毋滥）")
 
     if avail:
         return True, avail, ""  # 全量返回（不再截断——草稿要如实展示所有可用会议室，2026-08-04 修：曾截到 5 间再截 2 间，草稿永远只显示前两间）
     return False, [], "该时段全量会议室均被占用"
+
+
+def build_emoji_chart(labels, dates, busy_by_date, work_start, work_end, today, now):
+    """生成面试官可约时段 emoji 色块图（纯文本，30分钟/格，09:00-18:00 共 18 格）。
+
+    2026-08-07 用户定稿：对话内图示化用纯文本色块，**不用 SVG 也不用 HTML**——
+    SVG 在部分渲染端降级成文本树（色块全丢只剩文字）、HTML 用户明确不要；
+    纯文本 emoji 不依赖任何渲染器，且能直接贴在草稿文字前。
+
+    字符：🟩 空闲可约 ｜ 🟥 已有会议 ｜ ⬜ 午休 ｜ ◽ 已过/周末
+    返回字符串列表（含图例），main 里插在草稿段之前。
+    """
+    CELL = datetime.timedelta(minutes=30)
+    ws_t = datetime.time(work_start, 0)
+    we_t = datetime.time(work_end, 0)
+    n = int((datetime.timedelta(hours=we_t.hour - ws_t.hour + (we_t.minute - ws_t.minute) / 60)) / CELL)
+    wd = "一二三四五六日"
+    lunch_s, lunch_e = datetime.time(12, 0), datetime.time(13, 30)
+    lines = [f"=== {'、'.join(labels)} 可约时段图示（{ws_t.strftime('%H:%M')}-{we_t.strftime('%H:%M')}，每格30分钟）===",
+             "图例：🟩 空闲可约 ｜ 🟥 已有会议 ｜ ⬜ 午休 ｜ ◽ 已过/周末"]
+    for d in dates:
+        past = d < today
+        weekend = d.weekday() >= 5
+        busy_segs = busy_by_date.get(d, [])
+        chars = []
+        for i in range(n):
+            t0 = datetime.datetime(d.year, d.month, d.day, ws_t.hour, ws_t.minute, tzinfo=TZ) + CELL * i
+            t1 = t0 + CELL
+            if lunch_s <= t0.time() < lunch_e:
+                ch = "⬜"
+            elif past or weekend or (d == today and t1 <= now):
+                ch = "◽"
+            else:
+                busy = any(s < t1 and t0 < e for s, e, *_ in busy_segs)
+                ch = "🟥" if busy else "🟩"
+            chars.append(ch)
+        tail = " 已过" if past else (" 周末" if weekend else "")
+        lines.append(f"{d.month}/{d.day}（周{wd[d.weekday()]}）{''.join(chars)}{tail}")
+    return lines
 
 
 def main():
@@ -824,10 +909,21 @@ def main():
     candidates = []
     for idx, pair in enumerate(args.candidates.split(",")):
         if "=" not in pair:
-            print(f"[⚠️ 跳过] 候选人格式错误（需 姓名=时间 或 姓名=时间@岗位）: {pair}")
+            print(f"[⚠️ 跳过] 候选人格式错误（需 姓名=时间 或 姓名=时间@岗位 或 姓名=时间#线下）: {pair}")
             continue
         name, raw_time = pair.split("=", 1)
         name = name.strip()
+        # 拆出 #形式覆盖（可选，2026-08-12 新增：同面试官跨形式合并跑）
+        # 格式：姓名=时间#线下 或 姓名=时间@岗位#线下
+        form_override = ""
+        if "#" in raw_time:
+            raw_time, form_override = raw_time.rsplit("#", 1)
+            form_override = form_override.strip()
+            if form_override == "现场":
+                form_override = "线下"
+            if form_override not in ("视频", "线下"):
+                print(f"[⚠️ 形式覆盖] '{form_override}' 不支持，用全局 --form {args.form}")
+                form_override = ""
         # 拆出 @岗位方向（可选，草稿展示用）
         role = ""
         if "@" in raw_time:
@@ -846,19 +942,21 @@ def main():
         candidates.append({
             "name": name, "dates": dates, "time_hint": time_hint, "raw": raw_time,
             "role": role,  # @后的岗位方向（草稿展示用，可选）
+            "form": form_override or args.form,  # #后的形式覆盖（可选，无则用全局 --form）
             "talent_id": tid, "ats": ats,
         })
 
     if args.dry_run:
         print("\n=== [dry-run] 解析结果 ===")
         print(f"面试官: {labels}")
-        print(f"形式: {args.form}")
+        print(f"形式: {args.form}（全局）")
         for c in candidates:
             role_tag = f" [{c['role']}]" if c["role"] else ""
+            form_tag = f" #{c['form']}" if c.get("form") and c["form"] != args.form else ""
             ats = c.get("ats") or {}
             ats_str = f" ATS={ats.get('job','?')}/{ats.get('stage','?')}/面{ats.get('interview_count','?')}" if ats else " ATS=【缺】"
             tid_str = f" tid={c['talent_id']}" if c["talent_id"] else ""
-            print(f"  {c['name']}{role_tag}{tid_str}{ats_str}: 日期={[weekday_cn(d)+str(d) for d in c['dates']]}, 时段偏好={c['time_hint']}")
+            print(f"  {c['name']}{role_tag}{form_tag}{tid_str}{ats_str}: 日期={[weekday_cn(d)+str(d) for d in c['dates']]}, 时段偏好={c['time_hint']}")
         return
 
     # ③ 查面试官共同空闲（覆盖所有候选人提到的日期 + 未来 N 天）
@@ -1046,6 +1144,10 @@ def main():
             parts.append(f"{'、'.join(names_grp)}推进{role}")
         return "，".join(parts)
 
+    # 候选人 form 集合（per-candidate 覆盖生效时用）
+    cand_forms = {c.get("form", args.form) for c in candidates}
+    mixed_form = len(cand_forms) > 1
+
     if len(matched) == 1:
         name = matched[0]
         m = cand_matches[name]
@@ -1053,7 +1155,8 @@ def main():
         progress, _ = progress_text(
             (ats or {}).get("stage"), (ats or {}).get("interview_count"), (ats or {}).get("latest_conclusion"),
         )
-        form_cn = "视频" if args.form == "视频" else "线下"
+        c_form = next((c.get("form", args.form) for c in candidates if c["name"] == name), args.form)
+        form_cn = "视频" if c_form == "视频" else "线下"
         block = _candidate_block(name, m["role"], m["raw"], m["hits"], ats, form_cn)
         need_user = ""
         if not ats or not progress:
@@ -1069,20 +1172,42 @@ def main():
         )
     else:
         # 多人：称谓 → 这是谁/推进几面 → 我沟通了时间 → 具体安排
+        # 2026-08-12 修：按拟安排时间排序（时间早的在前），面试官一眼看到排期顺序
+        def _sort_key(name):
+            m = cand_matches.get(name, {})
+            hits = m.get("hits", [])
+            if not hits:
+                return (9999, 99, 99, 99)
+            wd, ds, t, _ = hits[0]
+            # ds = "8-14", t = "11:15"
+            try:
+                mm, dd = ds.split("-")
+                hh, mi = t.split(":")
+                return (int(mm), int(dd), int(hh), int(mi))
+            except Exception:
+                return (9999, 99, 99, 99)
+        matched_sorted = sorted(matched, key=_sort_key)
         blocks = []
-        form_cn = "视频" if args.form == "视频" else "线下"
-        for name in matched:
+        for name in matched_sorted:
             m = cand_matches[name]
+            c_form = next((c.get("form", args.form) for c in candidates if c["name"] == name), args.form)
+            form_cn = "视频" if c_form == "视频" else "线下"
             blocks.append(_candidate_block(name, m["role"], m["raw"], m["hits"], name_to_ats.get(name), form_cn))
         body = "\n\n".join(blocks)
-        summary = _summary_phrase(matched, name_to_ats)
-        job_brief = _job_brief([name_to_ats.get(n) for n in matched], args.team) or header_line
+        summary = _summary_phrase(matched_sorted, name_to_ats)
+        job_brief = _job_brief([name_to_ats.get(n) for n in matched_sorted], args.team) or header_line
         # 会议室信息不展示在草稿尾部（2026-08-04 用户定稿：有会议室就别提，只在无可用时另行告警）
         room_tail = ""
+        if mixed_form:
+            # 混合形式（有人视频有人线下）：结尾不带形式词
+            tail = f"这几个面试时间都避开了你日程上的会议{room_tail}，看看可以的话我去敲定。"
+        else:
+            tail_form_cn = "视频" if args.form == "视频" else "线下"
+            tail = f"这几个{tail_form_cn}面试时间都避开了你日程上的会议{room_tail}，看看可以的话我去敲定。"
         draft = (
             f"{salutation}，{job_brief}，{summary}，我和候选人沟通了一下面试时间：\n\n"
             f"{body}\n\n"
-            f"这几个{form_cn}面试时间都避开了你日程上的会议{room_tail}，看看可以的话我去敲定。"
+            f"{tail}"
         )
 
     # ⑥ stdout 直出（删 _schedule_match.txt——git-bash UTF-8 不乱码，AGENTS.md 已确认）
@@ -1140,6 +1265,11 @@ def main():
     out.extend(lines_result)
     out.append("")
     out.append("  选择规则：11:00、15:00-18:00 黄金时段优先；避开 09:00 过早 / 12:00-13:30 午休 / 18:00+ 偏晚；同一面试官多候选人自动防撞档。")
+    out.append("")
+
+    # —— emoji 色块图示（纯文本，2026-08-07 起：对话内图示化主载体，贴在草稿前；不依赖渲染器）
+    now = datetime.datetime.now(TZ)
+    out.extend(build_emoji_chart(labels, all_dates_in_range, busy_by_date, work_start, work_end, today, now))
     out.append("")
 
     out.append("=== 可转发草稿（完整版，AI 只在【需问用户】处介入）===")
