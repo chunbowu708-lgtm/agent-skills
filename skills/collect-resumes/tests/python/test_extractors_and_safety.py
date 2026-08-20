@@ -16,7 +16,7 @@ import zipfile
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__)) + os.sep + ".." + os.sep + ".." + os.sep + "scripts"
 sys.path.insert(0, SCRIPTS_DIR)
 
-from content_extractors import extract, extract_pdf, extract_docx, ExtractResult
+from content_extractors import extract, extract_pdf, extract_docx, extract_doc, ExtractResult
 from archive_safety import check_zip, SafetyResult
 
 
@@ -105,6 +105,17 @@ class TestContentExtractors(unittest.TestCase):
         self.assertTrue(result.blocked)
         self.assertIn("不支持", result.block_reason)
 
+    def test_doc_dispatch_to_extract_doc(self):
+        """.doc 走 extract_doc（antiword），不返回"不支持"——即使 antiword 失败也是 .doc 专属阻断而非通用阻断。"""
+        p = os.path.join(self.tmpdir, "resume.doc")
+        # 写一个假 .doc（非真正 OLE2），antiword 会失败
+        with open(p, "wb") as f:
+            f.write(b"not a real doc")
+        result = extract(p)
+        # 不是通用"不支持"，而是 .doc 专属阻断（antiword 失败或提取失败）
+        self.assertTrue(result.blocked)
+        self.assertNotIn("不支持", result.block_reason)
+
 
 class TestArchiveSafety(unittest.TestCase):
 
@@ -176,12 +187,28 @@ class TestArchiveSafety(unittest.TestCase):
         self.assertIn("加密", result.reason)
 
     def test_nested_archive_blocked(self):
+        """纯嵌套归档 zip（只有 inner.zip）→ 阻断；嵌套成员显式警告（不静默）。"""
         p = os.path.join(self.tmpdir, "nested.zip")
         with zipfile.ZipFile(p, "w") as zf:
             zf.writestr("inner.zip", b"PK fake inner zip")
         result = check_zip(p)
         self.assertTrue(result.blocked)
-        self.assertIn("嵌套归档", result.reason)
+        self.assertTrue(
+            any("嵌套归档" in w for w in result.warnings) or "无任何可验证" in result.reason,
+            f"嵌套成员必须显式暴露（不静默跳过）: reason={result.reason} warnings={result.warnings}")
+
+    def test_mixed_zip_with_nested_member_warns(self):
+        """简历 + 嵌套 zip 混合包 → 放行简历校验，但嵌套成员必须警告（防藏薪酬走私）。"""
+        p = os.path.join(self.tmpdir, "mixed_nested.zip")
+        tmp_pdf = os.path.join(self.tmpdir, "inner.pdf")
+        make_text_pdf(tmp_pdf, "Test Resume")
+        with zipfile.ZipFile(p, "w") as zf:
+            zf.write(tmp_pdf, "resume.pdf")
+            zf.writestr("bonus.zip", b"PK fake inner zip")
+        result = check_zip(p)
+        self.assertFalse(result.blocked, f"有简历成员不应整包阻断: {result.reason}")
+        self.assertTrue(any("嵌套归档" in w for w in result.warnings),
+                        f"嵌套成员必须警告（旧版静默 continue = 走私洞）: {result.warnings}")
 
     def test_empty_zip_blocked(self):
         p = os.path.join(self.tmpdir, "empty.zip")
@@ -232,6 +259,18 @@ class TestArchiveSafety(unittest.TestCase):
         # 不应有"纯作品包"警告（因为有简历）
         self.assertFalse(any("纯作品包" in w for w in result.warnings))
 
+    def test_doc_member_treated_as_resume(self):
+        """.doc 在 ZIP 内时按简历对待（2026-07-29：从作品素材移到简历，参与姓名/薪酬校验）。"""
+        p = os.path.join(self.tmpdir, "with_doc.zip")
+        with zipfile.ZipFile(p, "w") as zf:
+            # 写一个假 .doc 成员（内容不重要，只验证分类）
+            zf.writestr("resume.doc", b"\xD0\xCF\x11\xE0 fake ole2")
+        result = check_zip(p)
+        self.assertFalse(result.blocked, f".doc 不应阻断 zip 安全检查: {result.reason}")
+        resume_members = [m for m in result.members if m["is_resume"]]
+        self.assertEqual(len(resume_members), 1, ".doc 成员应标记为 is_resume=True")
+        self.assertEqual(resume_members[0]["ext"], ".doc")
+
 
 class TestSalaryRegex(unittest.TestCase):
     """薪酬正则专项测试（2026-07-16：26k-28k BOSS模板格式漏匹配修复）。
@@ -269,6 +308,32 @@ class TestSalaryRegex(unittest.TestCase):
     def test_in_context(self):
         """BOSS模板完整行（真实案例：卢东成简历）"""
         self.assertTrue(self._hits("在职，正在找工作 丨广州 丨U3D 丨26k-28k"))
+
+    def test_bare_wan_range(self):
+        """裸万/W区间（无关键词前缀）：25万-30万、20W-30W（2026-07-29 补漏）"""
+        self.assertTrue(self._hits("25万-30万"))
+        self.assertTrue(self._hits("20W-30W"))
+        self.assertTrue(self._hits("15w-20w"))
+
+    def test_english_single_value(self):
+        """英文单值（无区间）：Salary: 30K、Pay: 28K（2026-07-29 补漏）"""
+        self.assertTrue(self._hits("Salary: 30K"))
+        self.assertTrue(self._hits("Pay: 28K"))
+        self.assertTrue(self._hits("salary 25k"))
+
+    def test_bare_amount_with_keyword(self):
+        """薪资词+裸4位金额：月薪30000/底薪18000/带单位/区间"""
+        self.assertTrue(self._hits("月薪30000"))
+        self.assertTrue(self._hits("底薪18000"))
+        self.assertTrue(self._hits("期望薪资30000"))
+        self.assertTrue(self._hits("月薪30000/月"))
+        self.assertTrue(self._hits("月薪30000-35000"))
+
+    def test_no_year_date_false_positive(self):
+        """薪资词后跟年份/日期不误报（guard: (?![年]|[-/]\\d)）"""
+        for safe in ["期望到岗时间2026年8月", "期望入职时间2026-08-15",
+                      "2026-08-15 至今", "期望2026年到岗"]:
+            self.assertFalse(self._hits(safe), f"误伤日期文本: {safe}")
 
     def test_no_false_positive(self):
         """正常数字不应误伤（百分比/版本号/日期/性能数据）"""

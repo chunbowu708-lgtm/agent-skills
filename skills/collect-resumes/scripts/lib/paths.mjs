@@ -14,9 +14,13 @@ export const RESULTS_DIR = process.env.RESULTS_DIR_PATH || 'notes/_download_resu
 // ---- 归档与下载 ----
 // ⚠️ ARCHIVE_ROOT 与 paths.py:13 的 ARCHIVE_ROOT 必须一致（JS/Python 无法共享文件，靠双向同步）。
 // 改这里必须同步改 paths.py:13，反之亦然。
-export const ARCHIVE_ROOT = '<PROJECT_ROOT>/data/在招岗位候选人管理';
-export const DOWNLOADS_DIR = 'F:/Users/wuchunbo/Downloads';
-export const UNSAFE_DIR = 'F:/Users/wuchunbo/Downloads/collect-resumes-manual';
+export const ARCHIVE_ROOT = process.env.ARCHIVE_ROOT || 'data/在招岗位候选人管理';
+export const DOWNLOADS_DIR = process.env.DOWNLOADS_DIR || 'Downloads';
+export const UNSAFE_DIR = (process.env.DOWNLOADS_DIR || 'Downloads') + '/collect-resumes-manual';
+
+// ---- 可选依赖 ----
+// playwright 装在项目根 <PROJECT_ROOT>（skill 目录外），import 失败时的 fallback 加载路径
+export const PLAYWRIGHT_FALLBACK = process.env.PLAYWRIGHT_PATH || 'playwright';
 
 // ---- execSync 参数 ----
 export const MAX_BUFFER = 50 * 1024 * 1024; // 50MB（lark-cli 分页响应可能很大）

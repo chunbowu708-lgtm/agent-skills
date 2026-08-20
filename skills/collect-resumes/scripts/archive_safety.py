@@ -25,7 +25,7 @@ import re
 import zipfile
 
 # 安全限制
-MAX_MEMBERS = 200          # ZIP 内最大成员数
+MAX_MEMBERS = 1000         # ZIP 内最大成员数（美术作品集文件多，200→500→1000）
 MAX_TOTAL_UNCOMPRESSED = 4 * 1024 * 1024 * 1024  # 4GB 总解压大小
 MAX_SINGLE_FILE_DOC = 500 * 1024 * 1024          # 500MB 简历文档单文件
 MAX_SINGLE_FILE_MEDIA = 2 * 1024 * 1024 * 1024   # 2GB 作品视频单文件
@@ -35,7 +35,7 @@ MAX_COMPRESSION_RATIO = 100    # 压缩比上限（解压大小/压缩大小）
 # .doc 加在此处（2026-07-29：老式 .doc 经 antiword 可提取，纳入校验）
 ALLOWED_MEMBER_EXTS = {".pdf", ".docx", ".doc", ".png", ".jpg", ".jpeg", ".gif", ".bmp"}
 # 作品素材扩展名（允许存在于 ZIP 内，但不做姓名/薪酬提取——视频无法 OCR）
-PORTFOLIO_MEDIA_EXTS = {".mp4", ".mov", ".avi", ".mpg", ".webm", ".psd", ".ai", ".riff", ".ase", ".ppt", ".pptx"}
+PORTFOLIO_MEDIA_EXTS = {".mp4", ".mov", ".avi", ".mpg", ".webm", ".wmv", ".psd", ".ai", ".riff", ".ase", ".ppt", ".pptx", ".md", ".svg", ".tiff", ".xml", ".txt", ".rels", ".spine", ".skel", ".json", ".atlas"}
 # 简历扩展名（需要做姓名/薪酬提取）
 # .doc 是老式二进制 Word 格式（python-docx 不支持，走 antiword 提取）
 # 2026-07-29：从 PORTFOLIO_MEDIA_EXTS 移到此处，使 .doc 在 zip 内也参与姓名/薪酬校验
@@ -113,6 +113,7 @@ def check_zip(zip_path):
         return SafetyResult(blocked=True, reason=f"成员数 {len(infos)} 超过上限 {MAX_MEMBERS}")
 
     safe_members = []
+    nested_members = []
     total_uncompressed = 0
 
     for info in infos:
@@ -121,9 +122,13 @@ def check_zip(zip_path):
         if info.is_dir():
             continue
 
-        # 1. 路径穿越检查（Zip Slip）
-        #    规范化后如果跳出临时根，或含绝对路径/盘符 → 阻断
         normalized = name.replace("\\", "/")
+
+        # 跳过 macOS 元数据（__MACOSX/ 目录和 ._ 前缀文件）
+        if "__MACOSX/" in normalized or os.path.basename(normalized).startswith("._"):
+            continue
+
+        # 1. 路径穿越检查（Zip Slip）
         if os.path.isabs(normalized) or re.match(r"^[A-Za-z]:", normalized):
             zf.close()
             return SafetyResult(blocked=True, reason=f"成员含绝对路径/盘符: {name}")
@@ -138,11 +143,15 @@ def check_zip(zip_path):
             zf.close()
             return SafetyResult(blocked=True, reason=f"成员是符号链接: {name}")
 
-        # 3. 嵌套归档检查
+        # 3. 嵌套归档（美术作品集可能含嵌套打包，跳过该成员不阻断）
         ext = os.path.splitext(name)[1].lower()
+        if not ext:
+            continue  # 无扩展名文件（如 _rels/.rels 等 Office 包隐藏元数据）跳过
         if ext in NESTED_ARCHIVE_EXTS:
-            zf.close()
-            return SafetyResult(blocked=True, reason=f"ZIP 内含嵌套归档 {ext}（不支持递归解包）: {name}")
+            # 不解压不扫描（工具不做递归拆包），但必须显式警告——
+            # 静默跳过会让"嵌套 zip 里藏薪酬简历"三层全放行
+            nested_members.append(name)
+            continue
 
         # 4. 加密检查
         #    ZIP 加密标志位：flag_bits & 0x1
@@ -177,11 +186,16 @@ def check_zip(zip_path):
     zf.close()
 
     if not safe_members:
-        return SafetyResult(blocked=True, reason="ZIP 内无任何可验证的有效成员")
+        result = SafetyResult(blocked=True, reason="ZIP 内无任何可验证的有效成员")
+        if nested_members:
+            result.warnings.append(f"含嵌套归档 {len(nested_members)} 个（未扫描内部）: {', '.join(nested_members[:3])}")
+        return result
 
     # 区分：有简历成员 vs 纯作品包
     has_resume = any(m["is_resume"] for m in safe_members)
     result = SafetyResult(members=safe_members)
+    if nested_members:
+        result.warnings.append(f"含嵌套归档 {len(nested_members)} 个（未扫描内部，如藏薪酬需人工拆包确认）: {', '.join(nested_members[:3])}")
     if not has_resume:
         result.warnings.append("纯作品包：无 PDF/DOCX 简历成员，跳过包内姓名/薪酬检查（简历 PDF 应在 zip 外单独验证）")
     return result

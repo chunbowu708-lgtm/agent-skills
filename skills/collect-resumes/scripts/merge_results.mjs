@@ -1,19 +1,19 @@
 // merge_results.mjs
-// 串行合并并行下载产生的独立结果 JSON 到主 manifest。
+// 合并下载产生的独立结果 JSON 到主 manifest。
 //
 // 用法: node merge_results.mjs [--manifest <path>] [--results-dir <path>]
 //
-// 为什么需要合并：多个 download_attachment 进程并行下载时，
-// 各自只写独立 .result.json（不改主 manifest），避免并发覆盖。
-// 下载全部完成后，由本脚本单进程串行读取所有结果并更新 manifest。
+// 定位：修复/收尾工具。download_attachment 和 batch_download_links 批量完成后
+// 已自动调用本模块的 mergeResults（单进程串行，无并发写风险）；独立运行本脚本
+// 用于多进程并行下载、批量中途 crash 后的恢复、清理残留 result.json。
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import {
   readManifest, writeManifestAtomic, getRecord, transitionRecord, upsertRecord,
 } from './lib/manifest.mjs';
 import { sha256File } from './lib/file_identity.mjs';
+import { getArg, isDirectRun } from './lib/cli_helpers.mjs';
 import { MANIFEST as MANIFEST_DEFAULT, RESULTS_DIR as RESULTS_DIR_DEFAULT } from './lib/paths.mjs';
 
 /**
@@ -52,8 +52,10 @@ export function mergeResults(manifestPath, resultsDir) {
         continue;
       }
 
-      // 前置状态校验：只有 verified/downloading/downloaded 可推进
+      // 前置状态校验：只有 verified/downloading/downloaded 可推进。
+      // 其余（已 archived/excluded/duplicate 等）= 结果文件已过时 → 删掉防残留。
       if (!['verified', 'downloading', 'downloaded'].includes(rec.status)) {
+        try { fs.unlinkSync(resultPath); } catch {}
         skipped++;
         continue;
       }
@@ -119,13 +121,7 @@ function main() {
   }
 }
 
-function getArg(args, name) {
-  const i = args.indexOf(name);
-  return i !== -1 ? args[i + 1] : undefined;
-}
-
-const isDirectRun = process.argv[1] &&
-  fileURLToPath(import.meta.url).replace(/\\/g, '/') === path.resolve(process.argv[1]).replace(/\\/g, '/');
-if (isDirectRun) main();
+const _isDirectRun = isDirectRun(import.meta.url);
+if (_isDirectRun) main();
 
 export { main };

@@ -2,11 +2,12 @@
 """
 verify_archive.py — 归档闸门
 
-五重阻断校验：数量 / 姓名 / 薪酬 / 格式 / manifest闭环。
-SHA-256 缓存加速重复校验（mtime/size 只做性能快筛，不做安全判定）。
+阻断校验：数量 / 薪酬 / manifest闭环（这三类任何不符即 STOP）。
+warning 级（不阻断，列给人复核）：姓名 miss/manual、提取阻断文件（加密zip/图片型PDF等）。
+SHA-256 缓存加速重复校验（缓存只做性能加速，不做安全判定）。
 
 ⚠️ 注意：本脚本不是纯只读。校验前会执行自愈逻辑：
-  - _finalize_pending_dirs：把 {M.DD}_暂定 目录 rename 为 {M.DD}_{N}份，删除空 _暂定 目录
+  - _finalize_pending_dirs：把 {M.DD}_暂定 目录合并为 {M.DD}_{N}份，删除空 _暂定 目录
   - _merge_split_batches：合并同天被拆成多个 _{k}份 的目录
 这些自愈操作在 collect 前执行（校验本身只读），但会 mutate 归档目录结构。
 
@@ -35,30 +36,22 @@ ZIP_EXT = (".zip",)
 RAR_EXT = (".rar", ".7z")
 RESUME_EXTS = (".pdf", ".docx", ".doc")
 RESUME_IMG_EXTS = (".jpg", ".jpeg", ".png")
-# 图片文件名含这些关键词才认作简历（纯作品图不误判）
-RESUME_IMG_KEYWORDS = ("简历", "resume", "Resume", "RESUME", "cv", "CV")
-
-TIER_DIR_NAMES = {"强推", "可推", "待定·不推"}
 
 def _is_resume_file(name):
     """是否为简历本体文件，跳过纯作品集。
-    PDF/DOCX/DOC 直接认；图片(jpg/jpeg/png)需文件名含「简历/resume/cv」才认（防把作品图当简历）。"""
+    PDF/DOCX/DOC 直接认；图片(jpg/jpeg/png)需「能解析出姓名 且 文件名含岗位词」才认——
+    BOSS 图片简历规范命名是「姓名_岗位_年限.png」（无"简历"关键词，岗位词如设计师/开发），
+    作品散图（demo.jpg/截图.png/张三_作品1.jpg）无岗位词 → 不会误判。"""
     low = name.lower()
-    if "作品集" in name or "portfolio" in low:
-        return False
     if low.endswith(RESUME_EXTS):
-        return True
-    if low.endswith(RESUME_IMG_EXTS) and any(k in name for k in RESUME_IMG_KEYWORDS):
-        return True
-    return False
-
-def _is_tier_dir(name):
-    n = name.strip().rstrip("/")
-    if n in TIER_DIR_NAMES:
-        return True
-    for t in ("待定", "不推", "强推", "可推"):
-        if t in n and ("不推" in n or t in ("强推", "可推")):
+        # 含「简历」的优先认（"简历和作品集.pdf"是合体文件，前几页是简历本体）
+        if "简历" in name or "resume" in low:
             return True
+        if "作品集" in name or "portfolio" in low:
+            return False
+        return True
+    if low.endswith(RESUME_IMG_EXTS) and ROLE_KW.search(name) and parse_name(name):
+        return True
     return False
 
 
@@ -109,7 +102,7 @@ def parse_name(fname):
 def name_in_text(name, txt):
     if not name:
         return "miss"
-    compact = re.sub(r"[ \t]+", "", txt)
+    compact = re.sub(r"\s+", "", txt)
     if name not in compact:
         return "miss"
     if len(name) >= 3:
@@ -124,7 +117,6 @@ def name_in_text(name, txt):
 # ---- 收集文件 ----
 class CollectResult:
     def __init__(self):
-        self.count_files = []   # 顶层条目（zip 算 1）
         self.scan_files = []    # (display_path, real_path) 需提取的文件
         self._tmpdir = None
 
@@ -172,8 +164,10 @@ def collect(root):
                             res.scan_files.append(("__BLOCKED__:" + zip_path + "!" + real_name, real_name))
                 else:
                     # 纯作品包：无简历成员，跳过姓名/薪酬（简历 PDF 应在 zip 外单独验证）
-                    for w in safety.warnings:
-                        print(f"  ℹ️ {os.path.basename(zip_path)}: {w}")
+                    pass
+                # 安全警告始终呈现（嵌套归档未扫描等，人工需知情）
+                for w in safety.warnings:
+                    print(f"  ℹ️ {os.path.basename(zip_path)}: {w}")
         except Exception as e:
             print(f"  🔴 ZIP 解压异常 {os.path.basename(zip_path)}: {e}")
             res.scan_files.append(("__BLOCKED__:" + zip_path, zip_path))
@@ -211,13 +205,10 @@ def collect(root):
     if os.path.isfile(root):
         low = root.lower()
         if _is_resume_file(root):
-            res.count_files.append(root)
             res.scan_files.append((root, root))
         elif low.endswith(ZIP_EXT):
-            res.count_files.append(root)
             handle_zip(root)
         elif low.endswith(RAR_EXT):
-            res.count_files.append(root)
             handle_rar(root)
         return res
 
@@ -225,26 +216,13 @@ def collect(root):
         for f in fs:
             full = os.path.join(d, f)
             low = f.lower()
-            # _is_resume_file 现在覆盖 .pdf/.docx/.doc（2026-07-29：补 .doc，修 M5 静默消失）
+            # _is_resume_file 覆盖 .pdf/.docx/.doc（.doc 经 antiword 提取）
             if _is_resume_file(f):
                 res.scan_files.append((full, full))
             elif low.endswith(ZIP_EXT):
                 handle_zip(full)
             elif low.endswith(RAR_EXT):
                 handle_rar(full)
-        if re.search(r"_\d+份$", os.path.basename(d.rstrip("/"))):
-            # 同时统计档位子目录和同级合法文件：
-            # 同级合法简历文件 + 档位目录内文件都计入（不能只数档位目录漏掉同级）。
-            tier_dirs = [dr for dr in dirs if _is_tier_dir(dr)]
-            # 同级合法简历文件（非档位目录、非 temp）
-            for f in fs:
-                if _is_resume_file(f) or f.lower().endswith(ZIP_EXT) or f.lower().endswith(RAR_EXT):
-                    res.count_files.append(os.path.join(d, f))
-            # 档位目录内的文件
-            for tdr in tier_dirs:
-                tpath = os.path.join(d, tdr)
-                for tf in os.listdir(tpath):
-                    res.count_files.append(os.path.join(tpath, tf))
     return res
 
 
@@ -278,7 +256,8 @@ def sha256_file(path):
 
 
 def _count_heads(dirpath):
-    """统计一个目录下的人头（按 parse_name 去重，含档位子目录递归）。"""
+    """统计一个目录下的人头（按 parse_name 去重，含档位子目录递归）。
+    数量闸门与本函数同口径——两套口径会自相打架（一个 rename 成 _2份、一个数出 1 人）。"""
     heads = set()
     for root2, _, files2 in os.walk(dirpath):
         for fn in files2:
@@ -289,20 +268,81 @@ def _count_heads(dirpath):
     return heads
 
 
+def _rename_dir_with_fallback(src, dst):
+    """目录 rename；Windows 下目录被占用（资源管理器/阅读器句柄锁）会 PermissionError，
+    fallback 到 copytree+rmtree。返回警告列表（数据不丢，最多留残留）。"""
+    warnings = []
+    try:
+        os.rename(src, dst)
+        return warnings
+    except PermissionError:
+        pass
+    except OSError as e:
+        warnings.append(f"rename {src} → {dst} 失败: {e}（目录未动）")
+        return warnings
+    try:
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+    except OSError as e:
+        warnings.append(f"rename 被占用，copytree fallback 也失败 {src} → {dst}: {e}（目录未动）")
+        return warnings
+    try:
+        shutil.rmtree(src)
+    except OSError:
+        warnings.append(f"合并已复制完成，但旧目录被占用删不掉，请稍后手动删除: {src}")
+    return warnings
+
+
+def _merge_dir_contents(src_dir, dst_root, label, warnings):
+    """把 src_dir 内容合并进 dst_root（保留档位子目录结构）。
+
+    数据安全规则（修 P0 删库事故的根源）：
+    - 同名冲突文件不静默丢弃 → 加 _重投N 后缀保留新文件
+    - 源目录只在确已清空时删除；有残留保留并警告，绝不对可能含文件的目录 rmtree
+    返回移动文件数。
+    """
+    moved = 0
+    for root2, dir2, files2 in os.walk(src_dir):
+        rel = os.path.relpath(root2, src_dir)
+        dst_root2 = dst_root if rel == "." else os.path.join(dst_root, rel)
+        for fn in files2:
+            dst = os.path.join(dst_root2, fn)
+            src_f = os.path.join(root2, fn)
+            if os.path.exists(dst):
+                stem, ext = os.path.splitext(fn)
+                k = 1
+                while os.path.exists(os.path.join(dst_root2, f"{stem}_重投{k}{ext}")):
+                    k += 1
+                dst = os.path.join(dst_root2, f"{stem}_重投{k}{ext}")
+                warnings.append(f"{label}: 同名冲突，新文件保留为 {os.path.basename(dst)}")
+            os.makedirs(dst_root2, exist_ok=True)
+            shutil.move(src_f, dst)
+            moved += 1
+    # 自底向上清理空目录；src_dir 本身有残留文件时保留
+    for root2, dir2, files2 in os.walk(src_dir, topdown=False):
+        if not files2 and not dir2:
+            try:
+                os.rmdir(root2)
+            except OSError:
+                pass
+    leftover = sum(len(fs) for _, _, fs in os.walk(src_dir))
+    if leftover:
+        warnings.append(f"{label}: {leftover} 个文件因占用未移走，源目录保留: {src_dir}")
+    return moved
+
+
 def _finalize_pending_dirs(target):
-    """把 {M.DD}_暂定 中转目录 rename 为 {M.DD}_{N}份（N=同天总人头数）。
+    """把 {M.DD}_暂定 中转目录合并为 {M.DD}_{N}份（N=同天总人头数）。
 
-    resolve_records 在单条记录 resolve 时不知道整批 N，统一落 _暂定/。
-    本函数在闸门 collect 之前扫到所有 _暂定 目录，按文件名解析人头数后 rename，
-    使 _N份 标注自洽。空 _暂定 目录（无人头）→ 删除（避免空目录残留）。
+    resolve_records 在单条记录 resolve 时不知道整批 N，统一落 _暂定/；
+    本函数在闸门 collect 之前扫到所有 _暂定 目录，按文件名解析人头数后合并，
+    使 _N份 标注自洽。幂等：已是 _N份 的目录不动。
 
-    同天合并（2026-07-31 修）：增量归档时同一天可能先产生 7.31_3份（评估后含
-    强推/可推档位子目录），后又来 7.31_暂定。旧版只数 _暂定 自己的人头 →
-    rename 成 7.31_1份，与既有 7.31_3份 并存导致数量标注不自洽。现在改为：
-    扫同 {base} 前缀的所有 _{k}份 目录 + _暂定，合并全部人头到单一目标目录，
-    命名为 {base}_{总N}份，N 永远自洽。
-
-    幂等：已是 _N份 的目录不动；_暂定 目录 rename 后再次运行不会重复处理。
+    合并规则（2026-08-14 重写，修 P0 数据丢失）：
+    - 合并目标 final_path 绝不出现在合并源列表里（旧版 bug：同名重投场景下
+      final_path 既是目标又是源，文件全被 skip 后 rmtree(final_path) 删光整批）
+    - 同名冲突文件加 _重投N 后缀保留，不静默丢
+    - 源目录只在清空后删除（_merge_dir_contents 保证）
+    - 空 _暂定 仅在完全无文件（含说明.txt 等非简历文件）时才删除
     """
     if not os.path.isdir(target):
         return
@@ -312,15 +352,14 @@ def _finalize_pending_dirs(target):
                 continue
             pending_path = os.path.join(d, dn)
             base = dn[:-len("_暂定")]  # 去掉 _暂定 后缀，得到 {M.DD}
-            # 统计 _暂定 自己的人头
+            all_files = [f for _, _, fs in os.walk(pending_path) for f in fs]
             pending_heads = _count_heads(pending_path)
+            if not all_files:
+                shutil.rmtree(pending_path, ignore_errors=True)
+                print(f"  ℹ️ 删除空 _暂定 目录: {dn}（无任何文件）")
+                continue
             if len(pending_heads) == 0:
-                # 空目录：删除避免残留（可能是 resolve 后未下载的孤儿）
-                try:
-                    shutil.rmtree(pending_path)
-                    print(f"  ℹ️ 删除空 _暂定 目录: {dn}（无人头）")
-                except OSError:
-                    pass
+                print(f"  ⚠️ _暂定 {dn} 无简历文件但有 {len(all_files)} 个其他文件，保留待人工确认")
                 continue
             # 扫同 {base} 前缀的既有 _{k}份 目录（含档位子目录里已评估的人）
             siblings = []  # [(path, heads_set)]
@@ -336,48 +375,33 @@ def _finalize_pending_dirs(target):
             total_n = len(all_heads)
             final_name = f"{base}_{total_n}份"
             final_path = os.path.join(d, final_name)
-            # 选合并目标：若已有同 final_name 用之；否则用既有兄弟目录中人数最多的改名
-            if not os.path.exists(final_path):
-                # 把人数最多的兄弟目录作为合并基座（迁移文件最少）
+            warnings = []
+            if os.path.exists(final_path):
+                # final 已存在（典型：同人重投，人头集合不变）→ 只合并 _暂定 和其余兄弟
+                merge_sources = [pending_path] + [s[0] for s in siblings if s[0] != final_path]
+            else:
+                # 把人数最多的兄弟目录作为合并基座（迁移文件最少）；无兄弟（首份）则新建
+                merge_sources = [pending_path] + [s[0] for s in siblings]
                 if siblings:
                     siblings.sort(key=lambda x: len(x[1]), reverse=True)
-                    base_sib_path, _, _ = siblings[0]
-                    os.rename(base_sib_path, final_path)
-                    siblings = [(p, h, s) for p, h, s in siblings if p != base_sib_path]
-                # 若无兄弟（首份），创建空目录
+                    base_sib_path = siblings[0][0]
+                    merge_sources = [p for p in merge_sources if p != base_sib_path]
+                    warnings += _rename_dir_with_fallback(base_sib_path, final_path)
                 if not os.path.exists(final_path):
                     os.makedirs(final_path, exist_ok=True)
-            # 把 _暂定 和其余兄弟的内容合并进 final_path
             moved = 0
-            for src_dir in [pending_path] + [s[0] for s in siblings]:
-                for root2, dir2, files2 in os.walk(src_dir):
-                    # 保持档位子目录结构（强推/可推/待定·不推）
-                    rel = os.path.relpath(root2, src_dir)
-                    dst_root = final_path if rel == "." else os.path.join(final_path, rel)
-                    for fn in files2:
-                        dst = os.path.join(dst_root, fn)
-                        if os.path.exists(dst):
-                            continue
-                        os.makedirs(dst_root, exist_ok=True)
-                        shutil.move(os.path.join(root2, fn), dst)
-                        moved += 1
-                shutil.rmtree(src_dir)
+            for src_dir in merge_sources:
+                moved += _merge_dir_contents(src_dir, final_path, dn, warnings)
             print(f"  ℹ️ {dn} → {final_name}（+{len(pending_heads)}人，同天合并共{total_n}人，移动{moved}文件）")
+            for w in warnings:
+                print(f"  ⚠️ {w}")
 
 
 def _merge_split_batches(target):
-    """合并同天被拆成多个 {M.DD}_{k}份 的目录为单一 {M.DD}_{总N}份。
-
-    自愈增量归档 bug（2026-07-31）：同一天分两批 resolve+闸门时，第一批产
-    7.31_3份（评估后含档位子目录），第二批的 7.31_暂定 被旧版 rename 成
-    7.31_1份 → 同天并存 7.31_1份 + 7.31_3份，数量标注不自洽。本函数检测同
-    {base} 前缀存在 ≥2 个 _{k}份 目录时，合并全部人头到一个目录并重命名。
-    幂等：已是唯一 _{k}份 的不动。
-    """
+    """合并同天被拆成多个 {M.DD}_{k}份 的目录为单一 {M.DD}_{总N}份。幂等。"""
     if not os.path.isdir(target):
         return
     for d, dirs, files in os.walk(target):
-        # 按 base（去掉 _{k}份 后缀）分组
         groups = {}
         for dn in dirs:
             m = re.match(r'^(.+?)_\d+份$', dn)
@@ -387,7 +411,6 @@ def _merge_split_batches(target):
         for base, members in groups.items():
             if len(members) < 2:
                 continue  # 唯一，无需合并
-            # 统计总人头（跨目录去重）
             all_heads = set()
             paths = []
             for dn in members:
@@ -397,26 +420,20 @@ def _merge_split_batches(target):
             total_n = len(all_heads)
             final_name = f"{base}_{total_n}份"
             final_path = os.path.join(d, final_name)
-            # 选人数最多的目录做基座改名
-            paths.sort(key=lambda x: len(_count_heads(x[1])), reverse=True)
-            base_dn, base_path = paths[0]
-            if base_path != final_path:
-                os.rename(base_path, final_path)
-            # 合并其余目录内容
+            warnings = []
+            if os.path.exists(final_path):
+                rest = [(dn, p) for dn, p in paths if p != final_path]
+            else:
+                paths.sort(key=lambda x: len(_count_heads(x[1])), reverse=True)
+                base_dn, base_path = paths[0]
+                warnings += _rename_dir_with_fallback(base_path, final_path)
+                rest = paths[1:]
             moved = 0
-            for dn, p in paths[1:]:
-                for root2, dir2, files2 in os.walk(p):
-                    rel = os.path.relpath(root2, p)
-                    dst_root = final_path if rel == "." else os.path.join(final_path, rel)
-                    for fn in files2:
-                        dst = os.path.join(dst_root, fn)
-                        if os.path.exists(dst):
-                            continue
-                        os.makedirs(dst_root, exist_ok=True)
-                        shutil.move(os.path.join(root2, fn), dst)
-                        moved += 1
-                shutil.rmtree(p)
+            for dn, p in rest:
+                moved += _merge_dir_contents(p, final_path, dn, warnings)
             print(f"  ℹ️ 同天合并 {len(members)} 个目录 → {final_name}（{total_n}人，移动{moved}文件）")
+            for w in warnings:
+                print(f"  ⚠️ {w}")
 
 
 def main():
@@ -432,58 +449,72 @@ def main():
     # 2026-07-29：先把 _暂定 中转目录自动 rename 为 _{N}份（在 collect 之前，使 collect 看到最终目录）。
     # resolve_records 落 {M.DD}_暂定/（N 在单条 resolve 时未知），闸门收尾时数人头得到 N 后 rename，
     # 使 _N份 标注永远自洽。rename 在校验前做，fail-closed 语义不变（数量不符仍 STOP）。
-    _finalize_pending_dirs(args.target)
-    # 自愈：合并同天被拆成多个 _{k}份 的目录（增量归档 bug 遗留）
-    _merge_split_batches(args.target)
+    # 自愈收敛：target 是 _暂定 目录时（collect 编排器直接传下载目录），
+    # 先对它所在父目录做收敛，再把 target 重定向到收敛后的 _N份 目录。
+    if os.path.isdir(args.target) and args.target.rstrip("/\\").endswith("_暂定"):
+        parent = os.path.dirname(args.target.rstrip("/\\"))
+        _finalize_pending_dirs(parent)
+        _merge_split_batches(parent)
+        base = os.path.basename(args.target.rstrip("/\\"))[:-len("_暂定")]
+        newdirs = [n for n in os.listdir(parent)
+                   if n.startswith(base + "_") and re.search(r"_\d+份$", n)]
+        if newdirs:
+            args.target = os.path.join(parent, newdirs[0])
+    else:
+        _finalize_pending_dirs(args.target)
+        # 自愈：合并同天被拆成多个 _{k}份 的目录（增量归档 bug 遗留）
+        _merge_split_batches(args.target)
     res = collect(args.target)
     report = {"target": args.target, "errors": [], "warnings": [], "counts": {}}
+    is_single_file = os.path.isfile(args.target)
 
     try:
-        if not res.count_files:
-            print("🔴 没找到简历（pdf/docx/zip）")
+        if not res.scan_files:
+            print("🔴 没找到简历（pdf/docx/zip/rar）")
             report["errors"].append("no_resume_files")
             sys.exit(1)
 
-        # ---- 数量闸门 ----
-        print("【数量闸门】")
-        folders = {}
-        for f in res.count_files:
-            parts = f.replace("\\", "/").split("/")
-            key = "散落根目录"
-            for i, p in enumerate(parts):
-                if p in ("已收集简历", "收集到简历") and i + 1 < len(parts):
-                    key = parts[i + 1]
-                    break
-            folders.setdefault(key, []).append(f)
-
+        # ---- 数量闸门（单文件模式跳过：无批次目录语义）----
+        # 口径与 _finalize_pending_dirs/_merge_split_batches 的 _count_heads 完全一致：
+        # 递归、按姓名去重、只数简历/压缩包文件。两套口径会自相打架
+        # （_finalize rename 成 _2份、闸门数出 1 人 → 自我阻断）。
         count_mismatch = False
-        for k, fs in folders.items():
-            m = re.search(r"_(\d+)份", k)
-            if m:
-                claimed = int(m.group(1))
-                parsed_entries = [path for path in fs
-                                  if not re.search(r"temp|临时|tmp", os.path.basename(path.rstrip("/")), re.IGNORECASE)]
-                heads = set()
-                for i, p in enumerate(parsed_entries):
-                    nm = parse_name(os.path.basename(p.rstrip("/")))
-                    heads.add(nm if nm else f"__unnamed_{i}")
-                actual = len(heads)
+        if is_single_file:
+            print("【数量闸门】单文件模式，跳过（只做姓名/薪酬/格式校验）")
+        else:
+            print("【数量闸门】")
+            batch_dirs = {}   # abspath -> 目录名（含 _N份）
+            stray = []
+            for d, dirs, fs in os.walk(args.target):
+                dn = os.path.basename(d.rstrip("/\\"))
+                if re.search(r"_\d+份$", dn):
+                    batch_dirs[d] = dn
+                    dirs[:] = []   # 批次目录内部由 _count_heads 递归统计，不重复下钻
+                    continue
+                for f in fs:
+                    low = f.lower()
+                    if (_is_resume_file(f) or low.endswith(ZIP_EXT) or low.endswith(RAR_EXT)) \
+                            and not re.search(r"temp|临时|tmp", f, re.IGNORECASE):
+                        stray.append(os.path.join(d, f))
+            for d, dn in sorted(batch_dirs.items()):
+                claimed = int(re.search(r"_(\d+)份", dn).group(1))
+                actual = len(_count_heads(d))
                 if claimed != actual:
                     count_mismatch = True
-                    print(f"  ❌ {k}: 标注{claimed}份, 实际{actual}份")
+                    print(f"  ❌ {dn}: 标注{claimed}份, 实际{actual}份")
                 else:
-                    print(f"  ✅ {k}: {claimed}份")
-            else:
-                # 无 _N份 标注即阻断
-                print(f"  🔴 {k}: 目录名无 _N份 标注 → 阻断（归档后必须标注再校验）")
-                report["errors"].append(f"no_count_label:{k}")
+                    print(f"  ✅ {dn}: {claimed}份")
+            if not batch_dirs:
+                print("  🔴 未找到任何 _N份 批次目录")
+                count_mismatch = True
+            for s in stray:
+                print(f"  🔴 散落文件（不在 _N份 目录内）: {s}")
+                report["errors"].append(f"no_count_label:{os.path.basename(s)}")
                 count_mismatch = True
 
         # ---- 姓名 + 薪酬闸门 ----
         print("\n【姓名闸门 + 薪酬闸门 + 格式验证】")
-        name_issues = []
         sal_hits = []
-        blocked_files = []
         scan_salary = not args.names_only and not args.no_salary
         use_cache = not args.no_cache and not args.names_only
         cache = load_manifest_cache(args.target) if use_cache else {}
@@ -491,10 +522,10 @@ def main():
         cached_n = 0
 
         for display, real in sorted(res.scan_files, key=lambda x: x[0]):
-            # ZIP 安全检查阻断的文件
+            # ZIP 安全检查阻断的文件（美术岗作品zip可能无法机器验证 → 标warning让人工看原件）
             if display.startswith("__BLOCKED__:"):
-                print(f"  🔴 {display.replace('__BLOCKED__:', '')} → 阻断（无法验证）")
-                blocked_files.append(display)
+                print(f"  ⚠️ {display.replace('__BLOCKED__:', '')} → 阻断（无法验证，需人工看原件）")
+                report["warnings"].append(display)
                 continue
 
             fname = display.split("!")[-1].split("/")[-1]
@@ -518,13 +549,12 @@ def main():
             # 统一内容提取（PDF/DOCX/图片型 PDF OCR）
             result = extract_content(real)
             if result.blocked:
-                print(f"  🔴 {fname}  提取阻断: {result.block_reason}")
-                blocked_files.append(display)
-                report["errors"].append(f"extract_blocked:{fname}:{result.block_reason}")
+                # 图片型PDF/独立图片/.doc提取失败 → 美术岗常见，标warning不STOP（需人工看原件）
+                print(f"  ⚠️ {fname}  提取阻断: {result.block_reason}（需人工看原件）")
+                report["warnings"].append(f"extract_blocked:{fname}")
                 continue
 
             txt = result.text
-            nchar = result.nchar
 
             # 薪酬扫描
             this_sal = []
@@ -534,14 +564,12 @@ def main():
                     this_sal.append((fname, snip))
                 sal_hits.extend(this_sal)
 
-            # 姓名闸门
+            # 姓名闸门（warning 级：miss 多为 BOSS 加密PDF/先生文件名/英文名，
+            # 下载一致性已由 SHA-256 绑定兜底；真填串靠人工/对账发现）
             if not fn_name:
                 print(f"  ⚠️ {fname}  文件名解析不出姓名 → 需人工确认")
                 report["warnings"].append(f"no_name:{fname}")
                 continue
-            compact = txt.replace(" ", "").replace("\n", "")
-            head = compact[:400]
-            cands = CN.findall(head)
             verdict = name_in_text(fn_name, txt)
             file_clean = False
             if verdict == "pass":
@@ -551,8 +579,8 @@ def main():
                 print(f"  ⚠️ {fname}  正文含'{fn_name}'但疑似他人子串 → 需人工确认")
                 report["warnings"].append(f"name_manual:{fname}")
             else:
-                print(f"  🔴 {fname}  正文无'{fn_name}' → 疑下载填串，STOP！")
-                name_issues.append(display)
+                print(f"  ⚠️ {fname}  正文无'{fn_name}'（加密/无姓名/英文名），标warning")
+                report["warnings"].append(f"name_miss:{fname}")
             # 只缓存"姓名 pass + 无薪酬 + 未阻断"
             if file_clean and scan_salary and not this_sal and content_sha:
                 new_cache[cache_key] = {"sha256": content_sha, "name": fn_name}
@@ -582,10 +610,32 @@ def main():
             else:
                 mdata = json.load(open(args.manifest, encoding="utf-8"))
                 records = mdata.get("records", {})
-                # 闭环校验：只对"本目录涉及的 record"校验，不对全库中间态记录阻断。
-                # archived/duplicate/validated/excluded 都是合法终态/已处理态，不算阻断。
-                # blocked = 有问题需人工处理，算阻断。needs_resolution/verified = 流水线中间态，仅信息提示。
-                blocked_recs = [rid for rid, r in records.items() if r.get("status") == "blocked"]
+                # 闭环校验：只对"绑定到本目录树下批次"的记录校验，不扫全库——
+                # 全库扫描会让任何历史 blocked 记录劫持之后每一次闸门。
+                # 绑定键 = (target_dir 的父目录, 日期段)：_暂定 与 rename 后的 _N份 同键，
+                # 闸门跑在 rename 之后也能对上。
+                batch_keys = set()
+                if os.path.isdir(args.target):
+                    # 目标自身是批次目录时也算（verify 常直接跑在 _N份 上）
+                    m_self = re.match(r"^(.+?)_(?:\d+份|暂定)$", os.path.basename(args.target.rstrip("/\\")))
+                    if m_self:
+                        batch_keys.add((os.path.abspath(os.path.dirname(args.target)).replace("\\", "/").lower(), m_self.group(1)))
+                    for root2, dirs2, _ in os.walk(args.target):
+                        for dn in dirs2:
+                            m2 = re.match(r"^(.+?)_(?:\d+份|暂定)$", dn)
+                            if m2:
+                                batch_keys.add((os.path.abspath(root2).replace("\\", "/").lower(), m2.group(1)))
+
+                def _bound_to_target(r):
+                    td = (r.get("target_dir") or "").replace("\\", "/")
+                    if not td:
+                        return False
+                    parent = os.path.dirname(td.rstrip("/")).replace("\\", "/").lower()
+                    m3 = re.match(r"^(.+?)_(?:\d+份|暂定)$", os.path.basename(td.rstrip("/")))
+                    return bool(m3) and (parent, m3.group(1)) in batch_keys
+
+                blocked_recs = [rid for rid, r in records.items()
+                                if r.get("status") == "blocked" and _bound_to_target(r)]
                 # 统计各状态（仅信息展示，不阻断）
                 status_counts = {}
                 for r in records.values():
@@ -594,7 +644,7 @@ def main():
                 in_flight = sum(v for k, v in status_counts.items()
                                 if k in ("needs_resolution", "verified"))
                 if blocked_recs:
-                    print(f"  🔴 {len(blocked_recs)} 条记录 blocked（需人工处理）")
+                    print(f"  🔴 {len(blocked_recs)} 条绑定本批次的记录 blocked（需人工处理）")
                     report["errors"].append(f"records_blocked:{len(blocked_recs)}")
                     manifest_bad = True
                 if in_flight:
@@ -603,17 +653,16 @@ def main():
                 dist = ", ".join(f"{k}:{v}" for k, v in sorted(status_counts.items(), key=lambda x: -x[1]))
                 print(f"  📊 manifest {len(records)} 条记录状态分布: {dist}")
                 if not manifest_bad:
-                    print(f"  ✅ manifest 闭环检查通过（无 blocked 记录）")
+                    print(f"  ✅ manifest 闭环检查通过（本批次无 blocked 记录）")
 
         # ---- 最终判定 ----
         print("\n" + "=" * 40)
-        stop = bool(name_issues or count_mismatch or sal_hits or blocked_files or manifest_bad)
+        stop = bool(count_mismatch or sal_hits or manifest_bad)
         if stop:
             reasons = []
-            if name_issues: reasons.append("姓名不符")
             if count_mismatch: reasons.append("数量不符")
             if sal_hits: reasons.append("薪酬残留")
-            if blocked_files: reasons.append(f"{len(blocked_files)} 个文件阻断")
+            if manifest_bad: reasons.append("manifest闭环未过")
             print(f"🔴 STOP — {'/'.join(reasons)}，修复后再进评估")
             report["errors"].append(f"stop:{'/'.join(reasons)}")
         else:

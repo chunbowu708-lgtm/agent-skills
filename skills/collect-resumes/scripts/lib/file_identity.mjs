@@ -28,12 +28,19 @@ export function sha256File(filePath) {
 }
 
 /**
- * 通过 magic bytes 检测文件真实类型。
- * @returns {'pdf'|'zip'|'docx'|'doc'|'rar'|'7z'|'image'|'unknown'}
+ * 检测磁盘文件真实类型。只读文件头部（magic bytes 判定最多用前 200 字节，
+ * 大文件整读会 OOM——美术作品集 zip 可达 GB 级）。
+ * @returns {'pdf'|'zip'|'doc'|'rar'|'7z'|'image'|'html'|'unknown'}
  */
 export function detectFileType(filePath) {
-  const buf = fs.readFileSync(filePath);
-  return detectTypeFromBuffer(buf);
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const buf = Buffer.alloc(512);
+    const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
+    return detectTypeFromBuffer(buf.subarray(0, bytesRead));
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 /**
@@ -88,7 +95,8 @@ export function detectTypeFromBuffer(buf) {
 export function typeMatchesExtension(ext, detectedType) {
   const extLower = (ext || '').toLowerCase();
   if (extLower === 'pdf') return detectedType === 'pdf';
-  if (extLower === 'docx') return detectedType === 'zip' || detectedType === 'docx';
+  // DOCX 本质是 zip 容器，detectTypeFromBuffer 对 PK 头统一返回 'zip'
+  if (extLower === 'docx') return detectedType === 'zip';
   if (extLower === 'doc') return detectedType === 'doc';
   if (extLower === 'zip') return detectedType === 'zip';
   if (extLower === 'rar') return detectedType === 'rar';
@@ -138,11 +146,13 @@ export function commitVerifiedFile(partPath, targetPath, expectedType) {
     return { outcome: 'idempotent', sha256: sha };
   }
 
-  // 冲突：绝不覆盖，保留冲突副本供排查
+  // 冲突：绝不覆盖，保留冲突副本供排查（调用方可通过 err.conflictPath 清理）
   const conflictPath = `${targetPath}.conflict.${Date.now()}`;
   fs.renameSync(partPath, conflictPath);
-  throw new Error(
+  const err = new Error(
     `TARGET_CONFLICT: 目标 ${targetPath} 已存在但内容不同（新文件保留为 ${conflictPath}）。` +
     `原有 sha=${existingSha} 新文件 sha=${sha}。需人工裁决。`
   );
+  err.conflictPath = conflictPath;
+  throw err;
 }

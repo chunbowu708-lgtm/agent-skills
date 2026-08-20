@@ -12,8 +12,8 @@ const LARGE_ATTACHMENT_HOSTS = [
   'dashi.163.com',       // 网易邮箱大师云附件
   'dashi.163.com/html/cloud-attachment-download',
 ];
-const CLOUD_DISK_HOSTS = ['pan.baidu.com', 'aliyundrive', 'alipan.com', 'cloud.189.cn'];
-const PORTFOLIO_HOSTS = ['artstation.com', 'behance.net', 'zcool.com.cn', 'dribbble.com'];
+const CLOUD_DISK_HOSTS = ['pan.baidu.com', 'aliyundrive', 'alipan.com', 'cloud.189.cn', 'pan.quark.cn', 'drive.google.com', 'docs.google.com'];
+const PORTFOLIO_HOSTS = ['artstation.com', 'behance.net', 'zcool.com.cn', 'dribbble.com', 'lanhuapp.com'];
 const PORTFOLIO_TEXT_RE = /作品集|作品|portfolio|个人站|主页|homepage|behance|artstation/i;
 
 /**
@@ -29,17 +29,11 @@ export function extractLinks(html) {
   const decoded = decodeHtmlEntities(html);
   const results = [];
   const seen = new Set();
-  // 匹配 <a ... href="...">锚文本</a>
-  const anchorRe = /<a\s+[^>]*href\s*=\s*["']?([^"'\s>]+)["']?[^>]*>([\s\S]*?)<\/a>/gi;
-  let m;
-  while ((m = anchorRe.exec(decoded)) !== null) {
-    const rawUrl = m[1];
-    const text = stripTags(m[2] || '').trim();
-    // 跳过 mailto/javascript/空
-    if (!rawUrl || /^(mailto:|javascript:|#)/i.test(rawUrl)) continue;
+  const push = (rawUrl, text) => {
+    if (!rawUrl || /^(mailto:|javascript:|#)/i.test(rawUrl)) return;
     try {
       const normalized = normalizeUrl(rawUrl);
-      if (seen.has(normalized)) continue;
+      if (seen.has(normalized)) return;
       seen.add(normalized);
       results.push({ url: normalized, text, kind: classifyLink(normalized, text) });
     } catch {
@@ -50,6 +44,23 @@ export function extractLinks(html) {
         results.push({ url: rawUrl, text, kind: classifyLink(rawUrl, text) });
       }
     }
+  };
+  // 匹配 <a ... href="...">锚文本</a>
+  const anchorRe = /<a\s+[^>]*href\s*=\s*["']?([^"'\s>]+)["']?[^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = anchorRe.exec(decoded)) !== null) {
+    push(m[1], stripTags(m[2] || '').trim());
+  }
+  // 补捞无闭合标签的 <a href="...">（QQ 邮箱 HTML 常见，配 </p> 直接断）
+  // 已被上面闭合匹配吃掉的不会重复（seen 去重）
+  const openAnchorRe = /<a\s+[^>]*href\s*=\s*["']?([^"'\s>]+)["']?[^>]*>/gi;
+  while ((m = openAnchorRe.exec(decoded)) !== null) {
+    push(m[1], '');
+  }
+  // 纯文本裸 URL 兜底：链接不在 <a> 标签里、直接写在正文中（中文标点作边界，防吞句号）
+  const bareUrlRe = /https?:\/\/[^\s<>"')\]。，；、！？]+/gi;
+  while ((m = bareUrlRe.exec(decoded)) !== null) {
+    push(m[0], '');
   }
   return results;
 }

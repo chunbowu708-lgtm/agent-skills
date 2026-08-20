@@ -14,32 +14,30 @@
 
 ## 下载策略（按优先级）
 
-### 首选：batch_download_links.mjs 批量下载
+### 首选：batch_download_links.mjs 批量下载（或直接跑 collect.mjs，编排器自动调）
 
 **三种模式**（选哪个看场景）：
 
 ```bash
-# 【推荐·当天收简历】按 record ID 精准下载（只下今天的，不碰历史积压）
+# 【当天收简历】按 record ID 精准下载（只下今天的，不碰历史积压）
 node "…/scripts/batch_download_links.mjs" \
   --records "sha256:xxx,sha256:yyy" --manifest <PROJECT_ROOT>/notes/collection_manifest.json
 
-# 【清理历史积压】从 manifest 读所有 verified 的 link 记录全量下载
+# 【清历史积压】从 manifest 读所有 verified 的 link 记录全量下载
 node "…/scripts/batch_download_links.mjs" --manifest <path>
 
 # 【不走 manifest】直接传 URL
 node "…/scripts/batch_download_links.mjs" --urls "https://wx.mail.qq.com/..." "https://..."
 ```
 
-Playwright headless 浏览器自动打开链接 → 检测"失效"跳过 → 点下载 → 轮询等待完成 → 写 result.json + 移文件到 target_dir。
-- 自动处理 QQ/网易大附件的 SPA 动态渲染 + 失效检测
-- 串行处理（浏览器并行下载易冲突）
+- Playwright headless 打开链接 → 检测"失效"跳过 → 点下载 → 轮询等待完成 → 移文件到 target_dir + 写 result.json + **自动合并推进 archived**（无需再跑 merge_results）
+- 确认失效的链接自动推进 `blocked`（`LINK_EXPIRED`）——失效是永久性的，留在 verified 每次白试；blocked 让闸门能发现"该人材料从未归档"。处理：联系候选人重发，或 `resolve_records --exclude`
 - 快速失败：download 事件等 15 秒（需登录的页面按钮无效→跳过），传输超时 5 分钟
-- 依赖 `playwright` npm 包（装在 `<PROJECT_ROOT>/node_modules`）
-- 下载成功后自动写 result.json + 移文件到 manifest 绑定的 target_dir（`_暂定` 中转目录），`merge_results` 消费后推进 archived
+- 依赖 `playwright` npm 包（装在 `<PROJECT_ROOT>/node_modules`，脚本自动 fallback 加载）
 
 ### Fallback：Playwright MCP 手动操作
 
-脚本失败时，用 MCP 逐个打开链接点下载：
+脚本失败时（如页面改版按钮失效），用 MCP 逐个打开链接点下载：
 
 ```
 browser_navigate → 打开链接
@@ -49,9 +47,8 @@ browser_click → 点击
 ls -lh 确认大小合理 → cp 归档
 ```
 
-> 判断下载完成：目标文件大小连续 3 次轮询不变（间隔 2s），且 > 0。
 
-MCP 也失败 → 切 CDP Proxy（localhost:3456），操作方式相同。
+MCP 也失败 → 切 CDP Proxy（localhost:3456，仅 Claude Code 环境有 web-access skill；ZCode 环境直接走"用户手动下载"兜底）。
 
 ### 最后兜底：让用户手动下载
 
@@ -59,12 +56,11 @@ MCP 也失败 → 切 CDP Proxy（localhost:3456），操作方式相同。
 ```
 需手动下载：张三_特效设计师(260MB): https://wx.mail.qq.com/ftn/...
 ```
-用户下载到 Downloads 后说"好了"，从 Downloads 归档。
+用户下载到 Downloads 后说"好了"，从 Downloads 归档（手写 result.json 必须写到 `notes/_download_results/`，否则 merge 静默不认）。
 
-## 踩过的坑
+## 运行时注意
 
-- QQ 超大附件链接有时效，但通常30天有效。如果报 `fileid error`，先让用户确认是否真的过期再放弃
-- 网易超大附件在 body_html 里，下载链接可能被 HTML 实体编码（`&amp;` → `&`），提取时需 decode
-- 大文件（>100MB）下载后务必 `ls -lh` 确认大小合理，不要只看文件是否存在
-- **⚠️ 当天收简历不要用 `--manifest` 全量扫**：默认拉所有 verified 状态的 link（可能几十条历史积压），今天的候选人排在最后。教训（2026-08-04）：全量扫27条（含1.8GB文件），今天的2人排28/29，白等几小时。**用 `--records` 精准下**
-- **下载后必须跑 `merge_results` 推进状态**：旧版下载成功不写 result.json 导致状态卡 verified，下次全量扫重复下载（2026-08-04 已修复，下载成功自动写 result.json）
+- QQ 超大附件链接通常 30 天有效；报 `fileid error` 先让用户确认是否真过期再放弃
+- 网易超大附件链接可能被 HTML 实体编码（`&amp;`）——脚本已统一 decode，手提链接时注意
+- 大文件（>150MB）下载后 `ls -lh` 确认大小合理，不要只看文件是否存在
+- 全量模式（不传 `--records`）会把**所有** verified 历史链接串行拖出来下（可能几 GB）——当天收简历务必用 `--records` 或直接跑 `collect.mjs`（默认只下今天的）

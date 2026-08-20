@@ -9,10 +9,8 @@
 //
 // 设计：runWithRetry 包裹任意 fn，fn 抛出的错误若匹配限流特征则退避重试，否则直接抛。
 //       这样调用方无需关心限流，只管"调到成功或彻底失败"。
+// （lark-cli 命令执行器见 lib/cli_helpers.mjs 的 runLarkSync/makeLarkRunner，不在本文件）
 
-import { execSync } from 'node:child_process';
-
-// 飞书限流错误特征（code 或 message 子串）
 const RATE_LIMIT_CODES = ['99991400', '1234029', '11200'];
 const RATE_LIMIT_MSGS = [
   'frequency limit', 'too many requests', 'rate limit',
@@ -70,30 +68,4 @@ export async function runWithRetry(fn, opts = {}) {
     }
   }
   throw lastErr;
-}
-
-/**
- * 带限流重试地执行 lark-cli 命令并返回 stdout 字符串。
- *
- * execSync 在命令非0退出（含限流）时抛错，错误信息在 e.stderr。
- * 本函数把 stderr 也纳入限流判定，限流则退避重试。
- *
- * @param {string} cmd - 完整命令字符串
- * @param {object} opts - 同 runWithRetry，额外 maxBuffer
- * @returns {Promise<string>} stdout 字符串
- */
-export async function runLarkCliWithRetry(cmd, opts = {}) {
-  const maxBuffer = opts.maxBuffer ?? 50 * 1024 * 1024;
-  return runWithRetry(async () => {
-    try {
-      return execSync(cmd, { encoding: 'utf8', maxBuffer });
-    } catch (e) {
-      // execSync 抛错时把 stderr 拼进 message，让 isRateLimitError 能识别
-      const stderr = e.stderr || '';
-      const enriched = new Error((e.message || '') + ' ' + stderr);
-      enriched.stderr = stderr;
-      enriched.stdout = e.stdout || '';
-      throw enriched;
-    }
-  }, opts);
 }

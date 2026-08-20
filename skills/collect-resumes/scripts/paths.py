@@ -4,10 +4,12 @@ paths.py — Python 脚本共享路径常量单一真相源。
 verify_archive.py 和 redact_salary.py 从此 import，不各自硬编码。
 """
 
+import os
+
 SEVEN_ZIP = r"C:\Program Files\7-Zip\7z.exe"
 
 # verify_archive.py 的 SHA-256 缓存目录
-CACHE_DIR = "<PROJECT_ROOT>/notes/.verified_manifest"
+CACHE_DIR = os.path.join(os.environ.get("PROJECT_ROOT", os.getcwd()), "notes", ".verified_manifest")
 
 # 归档根目录。
 # ⚠️ JS 脚本用 lib/paths.mjs 的 ARCHIVE_ROOT（语言不同无法共享文件）。

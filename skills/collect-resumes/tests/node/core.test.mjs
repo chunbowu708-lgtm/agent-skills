@@ -12,7 +12,7 @@ import {
 } from '../../scripts/lib/manifest.mjs';
 import { parseCliJson } from '../../scripts/lib/lark_mail.mjs';
 import { extractLinks } from '../../scripts/lib/html_links.mjs';
-import { commitVerifiedFile, detectFileType, sha256File } from '../../scripts/lib/file_identity.mjs';
+import { commitVerifiedFile, detectFileType, sha256File, detectTypeFromBuffer, typeMatchesExtension } from '../../scripts/lib/file_identity.mjs';
 
 const tempDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'collect-resumes-'));
 
@@ -66,4 +66,16 @@ test('file commit is idempotent and never overwrites different content', () => {
   fs.writeFileSync(conflict, Buffer.from('%PDF-1.7\nsecond'));
   assert.throws(() => commitVerifiedFile(conflict, target, 'pdf'), /TARGET_CONFLICT/);
   assert.equal(sha256File(target), committed.sha256);
+});
+
+test('OLE2/CFB magic bytes detected as doc (老式 .doc 下载不再被拒)', () => {
+  // 老式 .doc/Excel/PPT 复合文档二进制头：D0 CF 11 E0 A1 B1 1A E1
+  const ole2 = Buffer.from([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0, 0, 0, 0]);
+  assert.equal(detectTypeFromBuffer(ole2), 'doc');
+  assert.equal(typeMatchesExtension('doc', 'doc'), true);
+  // .pdf 扩展名不应匹配 doc 内容
+  assert.equal(typeMatchesExtension('pdf', 'doc'), false);
+  // PDF/ZIP 仍正常（回归保护）
+  assert.equal(detectTypeFromBuffer(Buffer.from('%PDF-1.7 x')), 'pdf');
+  assert.equal(detectTypeFromBuffer(Buffer.from('PK\x03\x04 x')), 'zip');
 });

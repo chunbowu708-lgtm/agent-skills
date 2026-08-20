@@ -20,8 +20,8 @@ const TRANSITIONS = {
   downloading: ['downloaded', 'blocked'],
   downloaded: ['archived', 'blocked'],
   archived: ['validated', 'blocked'],
-  excluded: [],   // 终态
-  duplicate: [],  // 终态：同人同岗已归档过，重复投递跳过（2026-07-31）
+  excluded: ['needs_resolution'],   // 仅重复类排除码（DUPLICATE_*）可经 resolve --new-version 重开；resolveRecord 侧按码白名单把关，NOT_RESUME 等人工排除不放行
+  duplicate: ['needs_resolution'],  // 仅一条重开路：resolve --new-version（候选人更新版简历场景）
   blocked: ['needs_resolution', 'verified', 'downloading', 'downloaded', 'archived'], // 修复后回到安全状态
   validated: [],  // 终态
 };
@@ -54,6 +54,26 @@ export function transitionRecord(record, newStatus, context = {}) {
     updated.exclude_reason = { code: context.code, message: context.message || '' };
   }
   return updated;
+}
+
+/**
+ * 把一条记录推进到 excluded（结构化原因），按状态机合法路径多跳
+ * （verified→blocked→needs_resolution→excluded；状态机无 verified→excluded 直达边）。
+ * 单一实现：resolve_records --exclude 与下载器的同日冲突自动排除共用。
+ */
+export function transitionToExcluded(record, code, message) {
+  let r = record;
+  if (r.status === 'verified') {
+    r = transitionRecord(r, 'blocked', { code, message: `排除前置（${message}）` });
+  }
+  if (r.status === 'blocked') r = transitionRecord(r, 'needs_resolution');
+  if (['discovered', 'needs_resolution', 'downloading', 'downloaded'].includes(r.status)) {
+    r = transitionRecord(r, 'excluded', { code, message });
+  }
+  if (r.status !== 'excluded') {
+    throw new Error(`EXCLUDE_UNSUPPORTED: 状态 "${record.status}" 的记录不能排除（终态记录保留历史）`);
+  }
+  return r;
 }
 
 // ---- 稳定记录 ID ----
@@ -133,16 +153,41 @@ export function writeManifestAtomic(targetPath, data) {
 
 /**
  * 读取 manifest，不存在则返回空骨架。
+ * 读取时归一化历史非法状态（如 'skipped'，TRANSITIONS 无此键、永久卡死只能手改 JSON）
+ * → excluded（保留原因），任意写入方下次落盘即完成迁移。
  */
 export function readManifest(targetPath) {
   if (!fs.existsSync(targetPath)) {
-    return { schema_version: SCHEMA_VERSION, batches: {}, records: {} };
+    return { schema_version: SCHEMA_VERSION, batches: {}, records: {}, processed: {} };
   }
   const m = JSON.parse(fs.readFileSync(targetPath, 'utf8'));
   if (m.schema_version !== SCHEMA_VERSION) {
     throw new Error(`MANIFEST_SCHEMA_MISMATCH: 期望 v${SCHEMA_VERSION}，实际 v${m.schema_version}`);
   }
-  return m;
+  return migrateLegacyStates(m);
+}
+
+const KNOWN_STATUSES = new Set(Object.keys(TRANSITIONS));
+
+function migrateLegacyStates(m) {
+  const entries = Object.entries(m.records || {});
+  if (!entries.some(([, rec]) => rec && rec.status && !KNOWN_STATUSES.has(rec.status))) return m;
+  const records = {};
+  for (const [rid, rec] of entries) {
+    if (rec && rec.status && !KNOWN_STATUSES.has(rec.status)) {
+      records[rid] = {
+        ...rec,
+        status: 'excluded',
+        exclude_reason: {
+          code: `LEGACY_${String(rec.status).toUpperCase()}_MIGRATED`,
+          message: rec.skip_reason || `历史非法状态 "${rec.status}"，读取时自动归一化为 excluded`,
+        },
+      };
+    } else {
+      records[rid] = rec;
+    }
+  }
+  return { ...m, records };
 }
 
 /**

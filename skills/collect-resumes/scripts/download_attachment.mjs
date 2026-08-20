@@ -2,26 +2,30 @@
 //
 // 用法:
 //   node download_attachment.mjs --record <record_id> --manifest <path>
+//   node download_attachment.mjs --records <id1,id2,...> [--throttle 500] --manifest <path>
+//   node download_attachment.mjs --pending [--manifest <path>]          # 下载所有 verified 附件记录
 //   node download_attachment.mjs --unsafe-manual <MID> <输出路径> [附件序号]  (仅 Downloads 隔离目录)
 //
-// 常规模式只接受 --record，MID/附件ID/目标路径全部从 manifest 派生（防串件）。
+// 常规模式只接受 --record/--records/--pending，MID/附件ID/目标路径全部从 manifest 派生（防串件）。
 // 下载到 .part → 校验 → 原子 rename；目标存在绝不覆盖。
-// 结果写独立 .result.json，由 merge_results.mjs 串行合并（防并发覆盖）。
+// 结果写独立 .result.json 后**立即自动合并**到 manifest（推进到 archived）；
+// 单进程串行无并发写风险。merge_results.mjs 保留为独立工具，用于并行进程/中断恢复。
 
 import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { execSync } from 'node:child_process';
 import {
-  readManifest, getRecord,
+  readManifest, writeManifestAtomic, getRecord, upsertRecord, transitionToExcluded,
 } from './lib/manifest.mjs';
+import { mdd, recordDate } from './lib/dates.mjs';
 import {
   sha256File, detectTypeFromBuffer, commitVerifiedFile, typeMatchesExtension,
 } from './lib/file_identity.mjs';
 import { parseCliJson } from './lib/lark_mail.mjs';
-import { runLarkCliWithRetry, runWithRetry } from './lib/retry.mjs';
-import { LARK_CLI as CLI, UNSAFE_DIR, RESULTS_DIR, MANIFEST as MANIFEST_DEFAULT, MAX_BUFFER } from './lib/paths.mjs';
+import { runWithRetry } from './lib/retry.mjs';
+import { getArg, isDirectRun, runLarkSync } from './lib/cli_helpers.mjs';
+import { mergeResults } from './merge_results.mjs';
+import { LARK_CLI as CLI, UNSAFE_DIR, RESULTS_DIR, MANIFEST as MANIFEST_DEFAULT } from './lib/paths.mjs';
 
 /**
  * 下载 URL 到 buffer，带 content-length 校验和重试。
@@ -84,7 +88,7 @@ async function download(url, opts = {}) {
  * @returns {{ outcome: string, sha256: string, result_path: string }}
  */
 export async function downloadByRecord(manifest, recordId, runner) {
-  runner = runner || ((cmd) => execSync(cmd, { encoding: 'utf8', maxBuffer: MAX_BUFFER }));
+  runner = runner || runLarkSync;
 
   const rec = getRecord(manifest, recordId);
   if (!rec) throw new Error(`RECORD_NOT_FOUND: ${recordId}`);
@@ -183,7 +187,7 @@ async function unsafeManual(mid, outPath, attIdx) {
 }
 
 function runner_default(cmd) {
-  return execSync(cmd, { encoding: 'utf8', maxBuffer: MAX_BUFFER });
+  return runLarkSync(cmd);
 }
 
 // CLI 入口
@@ -205,52 +209,155 @@ async function main() {
   // 常规模式：拒绝旧式 MID + OUT
   const recordId = getArg(args, '--record');
   const recordsArg = getArg(args, '--records'); // 批量：逗号分隔的多个 record id
+  const pending = args.includes('--pending');   // 批量：自动取所有 verified 的附件记录
   const manifestPath = getArg(args, '--manifest') || MANIFEST_DEFAULT;
-  const throttleMs = parseInt(getArg(args, '--throttle') || '500', 10); // 批量间隔毫秒，默认0.5秒（download_url 有 runWithRetry 兜底限流，无需靠长间隔避）
+  const throttleMs = parseInt(getArg(args, '--throttle') || '500', 10); // 批量间隔毫秒（download_url 有 runWithRetry 兜底限流，无需靠长间隔避）
 
   // 检测旧式位置参数 → 明确拒绝
   const positional = args.filter(a => !a.startsWith('--'));
-  if (!recordId && !recordsArg && positional.length >= 2) {
+  if (!recordId && !recordsArg && !pending && positional.length >= 2) {
     console.error('🔴 拒绝旧式调用：MID + 输出路径 可导致串件。');
-    console.error('   请用 --record <id> --manifest <path>');
-    console.error('   批量用 --records <id1,id2,...> --manifest <path> [--throttle 2000]');
+    console.error('   请用 --record <id> / --records <id1,id2,...> / --pending [--manifest <path>]');
     console.error('   应急下载用 --unsafe-manual <MID> <Downloads内路径>');
     process.exit(1);
   }
 
   // ---- 批量模式：逐个下载 + 间隔（不连发，避免打爆飞书限流）----
-  // 2026-07-30：旧版无批量入口，调用方自己写循环连发 → 18连发打爆限流 → 拿损坏数据。
-  // 现在内置批量：一个一个下，每个之间间隔 throttleMs，让飞书限流窗口喘气。
-  // 单条失败不中断整批（记 failed 列表，最后汇总），失败的可单独重跑。
+  // 单条失败不中断整批（记 failed 列表，最后汇总），失败的可单独 --record 重跑。
+  // 下载完成后自动合并 result.json 推进 manifest 到 archived（批量是单进程串行，
+  // 无并发写风险；merge_results 作为独立脚本保留，用于并行进程/中断恢复场景）。
+  let batchIds = null;
   if (recordsArg) {
-    const ids = recordsArg.split(',').map(s => s.trim()).filter(Boolean);
-    if (!ids.length) {
+    batchIds = recordsArg.split(',').map(s => s.trim()).filter(Boolean);
+    if (!batchIds.length) {
       console.error('🔴 --records 需提供逗号分隔的 record id');
       process.exit(1);
     }
+  } else if (pending) {
     const manifest = readManifest(manifestPath);
-    const succeeded = [], failed = [];
-    for (let i = 0; i < ids.length; i++) {
-      const rid = ids[i];
-      process.stderr.write(`\n[${i + 1}/${ids.length}] ${rid.slice(0, 20)}...\n`);
+    batchIds = Object.values(manifest.records)
+      .filter(r => r.source_type === 'mail_attachment' && r.status === 'verified')
+      .map(r => r.record_id);
+    if (!batchIds.length) {
+      console.log('没有待下载的附件记录（verified 状态 0 条）');
+      return;
+    }
+    console.log(`--pending: ${batchIds.length} 条 verified 附件记录待下载`);
+  }
+
+  if (batchIds) {
+    let manifest = readManifest(manifestPath);
+    // ---- 批量前置自愈（2026-08-17 积压清理）----
+    // 1) target 路径脏数据：早期 resolve 产物有反斜杠路径/无日期段（直接指向已收集简历根）/
+    //    日期段=处理日而非收到日（8.13_暂定 但 received 7 月）。按契约重算：正斜杠 +
+    //    日期段=received_at 的 M.DD，同日期段已有 _N份 目录则直接进，否则 _暂定（闸门收敛）。
+    // 2) 已归档重复：同人同岗已有 archived/validated 记录的 verified → exclude，
+    //    不重复下载污染已评估档位（--backlog 清历史积压时的大头）。
+    let healed = 0, deduped = 0;
+    const archivedKeys = new Set(
+      Object.values(manifest.records)
+        .filter(r => ['archived', 'validated'].includes(r.status) && r.candidate_name)
+        .map(r => `${r.candidate_name}\u0000${r.job_name}`)
+    );
+    for (const rid of batchIds) {
+      const rec = manifest.records[rid];
+      if (!rec) continue;
+      // new-version 补充版：同人同岗是预期状态（旧版已归档），不去重
+      if (rec.new_version) continue;
+      if (rec.candidate_name && archivedKeys.has(`${rec.candidate_name}\u0000${rec.job_name}`)) {
+        manifest.records[rid] = transitionToExcluded(rec, 'DUPLICATE_ALREADY_ARCHIVED',
+          `同人同岗已有归档记录，积压清理时跳过重复下载`);
+        deduped++;
+        continue;
+      }
+      if (!rec.target_dir) continue;
+      let td = String(rec.target_dir).replace(/\\/g, '/');
+      // 仅当 target_dir 本身以「已收集简历」结尾（无日期段）才补 M.DD_暂定；
+      // 已带日期段（如 已收集简历/8.17_暂定）不能再套一层（2026-08-17 双嵌套 bug）
+      if (td.replace(/\/$/, '').endsWith('已收集简历')) {
+        td = `${td.replace(/\/$/, '')}/${mdd(recordDate(rec))}_暂定`;
+      } else if (td.endsWith('_暂定') && !fs.existsSync(td)) {
+        const day = mdd(recordDate(rec));
+        const existN = fs.existsSync(parent) && fs.readdirSync(parent)
+          .filter(n => n.startsWith(`${day}_`) && /_\d+份$/.test(n)).sort()[0];
+        td = existN ? `${parent}/${existN}` : `${parent}/${day}_暂定`;
+      }
+      if (td !== rec.target_dir) {
+        manifest.records[rid] = { ...rec, target_dir: td };
+        healed++;
+      }
+    }
+    if (healed || deduped) {
+      writeManifestAtomic(manifestPath, manifest);
+      console.log(`🔧 批量前置自愈：target 路径修正 ${healed} 条，已归档重复排除 ${deduped} 条`);
+      batchIds = batchIds.filter(rid => manifest.records[rid] && manifest.records[rid].status === 'verified');
+    }
+    const succeeded = [], failed = [], conflicts = [];
+    // 并发下载（2026-08-17）：串行时每份 ~2.3-3.5s，其中 lark-cli download_url 冷启动
+    // 占 50-65%。取 URL（吃 mail 域配额）并发 3 + runWithRetry 退避兜底限流；
+    // 文件落盘各写各的 .part/result.json 无共享态。SAMEDAY_CONFLICT 要写 manifest，
+    // 收集到批尾串行处理，避免并发写。
+    const CONCURRENCY = Math.max(1, Math.min(3, batchIds.length));
+    async function mapPool(items, worker, concurrency) {
+      const results = new Array(items.length);
+      let next = 0;
+      async function run() {
+        while (true) {
+          const i = next++;
+          if (i >= items.length) return;
+          results[i] = await worker(items[i], i);
+        }
+      }
+      await Promise.all(Array.from({ length: concurrency }, () => run()));
+      return results;
+    }
+    const outcomes = await mapPool(batchIds, async (rid, i) => {
+      process.stderr.write(`\n[${i + 1}/${batchIds.length}] ${rid.slice(0, 20)}...\n`);
       try {
         const result = await downloadByRecord(manifest, rid);
         console.log(`  ✅ ${result.outcome} (sha256=${result.sha256.slice(0, 12)}...)`);
-        succeeded.push(rid);
+        if (throttleMs > 0) await new Promise(r => setTimeout(r, throttleMs));
+        return { rid, ok: true };
       } catch (e) {
-        console.error(`  🔴 失败: ${e.message.slice(0, 100)}`);
-        failed.push({ id: rid, error: e.message.slice(0, 120) });
+        return { rid, ok: false, e };
       }
-      // 间隔（最后一个不等）
-      if (i < ids.length - 1 && throttleMs > 0) {
-        await new Promise(r => setTimeout(r, throttleMs));
+    }, CONCURRENCY);
+    for (const oc of outcomes) {
+      if (oc.ok) { succeeded.push(oc.rid); continue; }
+      const e = oc.e;
+      if (e.conflictPath) {
+        // 同人同日重复投递（同名目标已存在、内容不同，多为候选人当天重发同份简历）：
+        // 删 conflict 副本（未脱敏内容不得残留在归档目录），record 结构化排除。
+        // 真有新版简历的情况：源邮件仍在（message_id 可回溯），resolve --new-version 重开。
+        try { fs.unlinkSync(e.conflictPath); } catch {}
+        try {
+          const cur = readManifest(manifestPath);
+          const rec = cur.records[oc.rid];
+          const updated = transitionToExcluded(rec, 'SAMEDAY_CONFLICT',
+            `同名目标已存在且内容不同，判同日重复投递，保留已归档版本。目标: ${rec.target_filename}`);
+          writeManifestAtomic(manifestPath, upsertRecord(cur, updated));
+          console.log(`  ⏭️ 同日冲突已排除: ${rec.target_filename}`);
+          conflicts.push(oc.rid);
+        } catch (exErr) {
+          console.error(`  🔴 冲突排除失败: ${exErr.message.slice(0, 80)}`);
+          failed.push({ id: oc.rid, error: e.message.slice(0, 120) });
+        }
+      } else {
+        console.error(`  🔴 失败: ${e.message.slice(0, 100)}`);
+        failed.push({ id: oc.rid, error: e.message.slice(0, 120) });
       }
     }
-    console.log(`\n==== 批量完成: ✅ ${succeeded.length} · 🔴 ${failed.length} ====`);
+    console.log(`\n==== 批量完成（并发${CONCURRENCY}）: ✅ ${succeeded.length} · ⏭️ 同日冲突 ${conflicts.length} · 🔴 ${failed.length} ====`);
+    if (succeeded.length) {
+      const { merged, skipped, errors } = mergeResults(manifestPath);
+      console.log(`自动合并: ${merged} 条推进到 archived，${skipped} 条跳过${errors.length ? `，🔴 ${errors.length} 个合并错误` : ''}`);
+      for (const e of errors.slice(0, 5)) console.error(`  - ${e.file}: ${e.error}`);
+      if (errors.length) process.exitCode = 5;
+    }
     if (failed.length) {
       console.error('失败列表（可单独 --record 重跑）:');
       for (const f of failed) console.error(`  - ${f.id}: ${f.error}`);
-      process.exit(4); // 有失败 → 非零退出，但已完成的保留
+      process.exitCode = 4; // 有失败 → 非零退出，但已完成的保留
     }
     return;
   }
@@ -258,6 +365,7 @@ async function main() {
   if (!recordId) {
     console.error('用法: download_attachment.mjs --record <id> [--manifest <path>]');
     console.error('      download_attachment.mjs --records <id1,id2,...> [--throttle 2000] [--manifest <path>]');
+    console.error('      download_attachment.mjs --pending [--manifest <path>]   # 下载所有 verified 附件记录');
     console.error('      download_attachment.mjs --unsafe-manual <MID> <Downloads内路径> [序号]');
     process.exit(1);
   }
@@ -266,18 +374,13 @@ async function main() {
   try {
     const result = await downloadByRecord(manifest, recordId);
     console.log(`✅ ${result.outcome}: ${recordId} (sha256=${result.sha256.slice(0, 12)}...)`);
-    console.log(`   结果待合并: ${result.result_path}`);
+    const { merged } = mergeResults(manifestPath);
+    console.log(`自动合并: ${merged} 条推进到 archived`);
   } catch (e) {
     console.error(`🔴 下载失败: ${e.message}`);
     process.exit(4);
   }
 }
 
-function getArg(args, name) {
-  const i = args.indexOf(name);
-  return i !== -1 ? args[i + 1] : undefined;
-}
-
-const isDirectRun = process.argv[1] &&
-  fileURLToPath(import.meta.url).replace(/\\/g, '/') === path.resolve(process.argv[1]).replace(/\\/g, '/');
-if (isDirectRun) main();
+const _isDirectRun = isDirectRun(import.meta.url);
+if (_isDirectRun) main();

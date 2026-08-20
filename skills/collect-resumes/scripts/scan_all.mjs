@@ -1,14 +1,16 @@
 // 全量扫描邮箱，穷尽式（分页到 has_more=false）。
 //
-// 用法: node scan_all.mjs [--date 2026-06-15]   (不传 --date 则列出全部)
+// 用法: node scan_all.mjs
 // 输出候选邮件清单到 stdout，全量数据原子存 notes/_scan_all.json
 // 任何异常都不覆盖上一份完整快照（原子发布 + 诊断文件 + 非零退出）。
+// （不支持 --date；日期过滤在 verify_mails --date 做）
 
 import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseCliJson } from './lib/lark_mail.mjs';
 import { isNotification } from './lib/notifications.mjs';
+import { isDirectRun } from './lib/cli_helpers.mjs';
 import { LARK_CLI, SCAN_ALL as OUT, DIAG_DIR, MAX_BUFFER } from './lib/paths.mjs';
 
 const MAX_PAGES = 50; // 安全上限（200×50=10000 封）
@@ -27,10 +29,17 @@ function fetchPage(pageToken, runner) {
 
 /**
  * 核心扫描逻辑（可注入 runner，测试用）。
+ *
+ * 2026-08-14 增量改造：不再每次全量分页拉几百封（每天固定几分钟）。
+ * 传入上次快照的 message_id 集合，triage 分页倒序（新在前）——遇到已见过的
+ * message_id 说明后续页全是旧邮件，立即停止翻页，只拉"新邮件"几页。
+ * 结果由调用方合并：新邮件 + 旧快照 = 完整快照（新在前，旧在后，按 message_id 去重）。
+ *
  * @param {function} runner - (cmdString) => rawStdoutString
- * @returns {{ messages: array, complete: boolean, error?: string }}
+ * @param {Set<string>} prevIds - 上次快照的 message_id 集合（可空=全量穷尽，兼容首轮）
+ * @returns {{ messages: array, complete: boolean, error?: string, incremental?: boolean }}
  */
-export function runScan(runner) {
+export function runScan(runner, prevIds = null) {
   runner = runner || ((cmd) => execSync(cmd, { encoding: 'utf8', maxBuffer: MAX_BUFFER }));
 
   const allMessages = [];
@@ -38,6 +47,9 @@ export function runScan(runner) {
   let pageToken = '';
   let prevToken = null;
   let page = 0;
+  let hitPrevBoundary = false; // 已遇到上次快照的邮件 → 后续（若排序稳定）全是旧的
+  let quietPages = 0; // 边界命中后连续"0 新邮件"页数（防排序扰动：回复置顶/线程聚合会把新邮件排进旧区）
+  const QUIET_PAGES_TO_STOP = 2;
 
   while (true) {
     page++;
@@ -52,13 +64,24 @@ export function runScan(runner) {
         allMessages.push(it);
         newCount++;
       }
+      // 增量边界：本页出现上次快照已有的邮件
+      if (prevIds && id && prevIds.has(id)) {
+        hitPrevBoundary = true;
+      }
+    }
+    if (newCount > 0) quietPages = 0; else quietPages++;
+
+    process.stderr.write(`page ${page}: 本页${items.length}封(新增${newCount}) 累计${allMessages.length} has_more=${j.has_more}${hitPrevBoundary ? ` 增量边界命中(静默页${quietPages}/${QUIET_PAGES_TO_STOP})` : ''}\n`);
+
+    if (hitPrevBoundary && quietPages >= QUIET_PAGES_TO_STOP) {
+      // 边界命中后连续 N 页零新邮件 → 确认旧邮件区，安全停止。
+      // （不再"命中即停"：排序扰动时新邮件可能藏在边界后的 1-2 页）
+      return { messages: allMessages, complete: true, incremental: true };
     }
 
-    process.stderr.write(`page ${page}: 本页${items.length}封(新增${newCount}) 累计${allMessages.length} has_more=${j.has_more}\n`);
-
     if (!j.has_more) {
-      // 正常结束：完整穷尽
-      return { messages: allMessages, complete: true };
+      // 正常结束：完整穷尽（首轮或新邮件量小无边界命中）
+      return { messages: allMessages, complete: true, incremental: false };
     }
 
     const nextToken = j.page_token;
@@ -118,9 +141,22 @@ function writeDiagnostic(messages, error) {
  * 主入口。
  */
 export function main(runner) {
+  // 增量：读上次快照的 message_id 集合（不存在则全量穷尽，兼容首轮）
+  let prevMessages = [];
+  if (fs.existsSync(OUT)) {
+    try {
+      prevMessages = JSON.parse(fs.readFileSync(OUT, 'utf8'));
+      if (!Array.isArray(prevMessages)) prevMessages = [];
+    } catch (e) {
+      console.error(`⚠️ 旧快照解析失败，退回全量扫描: ${e.message}`);
+      prevMessages = [];
+    }
+  }
+  const prevIds = new Set(prevMessages.map(m => m && m.message_id).filter(Boolean));
+
   let result;
   try {
-    result = runScan(runner);
+    result = runScan(runner, prevIds);
   } catch (e) {
     // CLI 执行失败或 JSON 解析失败：不覆盖旧快照，写诊断，非零退出
     const diagPath = writeDiagnostic([], e.message);
@@ -139,28 +175,47 @@ export function main(runner) {
     process.exit(2);
   }
 
-  // 完整穷尽：原子发布
-  publishSnapshot(result.messages);
+  // 合并：新邮件 + 旧快照（新在前，旧在后，按 message_id 去重，新邮件优先覆盖旧字段）
+  let merged = result.messages;
+  if (result.incremental && prevMessages.length) {
+    const newIds = new Set(result.messages.map(m => m.message_id));
+    const stale = prevMessages.filter(m => !newIds.has(m.message_id));
+    merged = [...result.messages, ...stale];
+    console.log(`\n📈 增量扫描: 新增 ${result.messages.length} 封 + 旧快照 ${stale.length} 封 = ${merged.length} 封（跳过历史 ${prevMessages.length - stale.length} 封重复）`);
+  }
+
+  // 完整穷尽/增量截断：原子发布
+  publishSnapshot(merged);
 
   // 通知只打标签，不删除
-  const enriched = result.messages.map(m => ({
+  const enriched = merged.map(m => ({
     ...m,
     is_notification: isNotification(m),
   }));
   const candidates = enriched.filter(m => !m.is_notification);
 
-  console.log(`\n=== 共 ${enriched.length} 封，候选 ${candidates.length} 封，通知 ${enriched.length - candidates.length} 封 ===\n`);
-  candidates.forEach(m => {
-    console.log(`${m.date} | ${(m.from || '').slice(0, 28).padEnd(28)} | ${m.message_id} | ${m.subject}`);
-  });
+  console.log(`\n=== 共 ${enriched.length} 封，候选 ${candidates.length} 封，通知 ${enriched.length - candidates.length} 封 ===`);
+  // 2026-08-18：stdout 不再倾倒全量候选清单（913 封×每次 collect = 终端噪音）。
+  // 增量模式只打新增；全量清单写文件按需查。完整清单永远在快照 JSON 里。
+  if (result.incremental && result.messages.length) {
+    const newCandidates = result.messages.filter(m => !isNotification(m));
+    console.log(`本次新增 ${newCandidates.length} 封候选:`);
+    newCandidates.forEach(m => {
+      console.log(`${m.date} | ${(m.from || '').slice(0, 28).padEnd(28)} | ${m.subject}`);
+    });
+  } else if (!result.incremental) {
+    const listPath = OUT.replace(/\.json$/, '_candidates.txt');
+    try {
+      fs.writeFileSync(listPath, candidates.map(m => `${m.date} | ${m.from || ''} | ${m.message_id} | ${m.subject}`).join('\n'), 'utf-8');
+      console.log(`全量候选清单已写文件: ${listPath}（${candidates.length} 封，不再刷屏）`);
+    } catch { /* 写文件失败不阻塞扫描 */ }
+  }
 
-  process.stderr.write(`\n全量已原子发布: ${OUT}（${result.messages.length} 封，已按 message_id 去重）\n`);
+  process.stderr.write(`\n快照已原子发布: ${OUT}（${merged.length} 封，已按 message_id 去重${result.incremental ? '，增量模式' : '，全量穷尽'}）\n`);
 }
 
 // CLI 直接运行时执行 main；被 import 时不自动执行（测试可调 runScan/main）
-import { fileURLToPath } from 'node:url';
-const isDirectRun = process.argv[1] &&
-  fileURLToPath(import.meta.url).replace(/\\/g, '/') === path.resolve(process.argv[1]).replace(/\\/g, '/');
-if (isDirectRun) {
+const _isDirectRun = isDirectRun(import.meta.url);
+if (_isDirectRun) {
   main();
 }
