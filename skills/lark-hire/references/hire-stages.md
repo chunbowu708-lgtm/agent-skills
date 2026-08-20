@@ -63,6 +63,6 @@ STAGE_TYPE = {
 
 `terminate` 后 `active_status` 变 2（但 stage.type 不一定变），对账脚本以 `active_status==1` 判断"还在流程里"。
 
-## ATS ↔ 跟踪表映射
+## ~~ATS ↔ 跟踪表映射~~（已退役，2026-08-18）
 
-跟踪表（多维表格）的"状态"字段是人工/脚本填写的主观层，ATS 的 `stage.type` 是客观层。映射关系见 `recruit-followup/references/review-contract.md`，本文件不重复。
+跟踪表已退役，ATS `stage.type` 是唯一阶段事实源。历史映射规则见 `daily-recruit-report/references/review-contract.md` 的退役说明。

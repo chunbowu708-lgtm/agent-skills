@@ -95,7 +95,7 @@ python "…/analyze-resumes/scripts/collect_and_extract.py" \
 3. ZIP/RAR → **解压找包内简历**（文件名含"简历/resume"优先），提取简历文本（不会整包跳过）
 4. 图片型（JPG/PNG 或 is_valid=false 的 PDF）→ 标记"图片型，需人工看原件"，进兜底区
 5. 纯作品集（zip 内无简历文件）→ 标记"纯作品集"，不提取
-6. **BOSS 加密文本层 PDF**（2026-08-10 新增）：BOSS 直聘把 PDF 文本层替换成 hex token（如 `45e9a67e...~~`），`get_text()` 提取出的是乱码不是文字，但渲染层正常显示。`extract_text.py` 检测到 token 行占比 >60% 时自动判定为 BOSS 加密，**渲染页面为图片**（200dpi PNG），在 JSON 里返回 `render_pages: [路径...]`。主会话用视觉模型读图片内容 → 等效于"擦掉文本层看图像"，绕过 BOSS 反爬。
+6. **BOSS 加密文本层 PDF**（2026-08-10 新增）：BOSS 直聘把 PDF 文本层替换成 hex token（如 `45e9a67e...~~`），`get_text()` 提取出的是乱码不是文字，但渲染层正常显示。`extract_text.py` 检测到 token 行占比 >60% 时自动判定为 BOSS 加密，**渲染页面为图片**（200dpi PNG），在 JSON 里返回 `render_pages: [路径...]`。主会话用视觉模型读图片内容 → 等效于"擦掉文本层看图像"，绕过 BOSS 反爬。**2026-08-14 性能改造：只渲染前 8 页**（BOSS 加密简历核心信息在前几页，后面是作品集——79 页作品集从 79 张大图降到 8 张，耗时降 90%+）；超长页需看全页作品集时单独渲染。
 
 **输出**：每个候选人的文本 JSON（到 `--output-dir`）+ stdout 清单表（姓名/工作室/岗位/状态/文本长度/来源）。
 
@@ -136,6 +136,8 @@ python "…/analyze-resumes/scripts/collect_and_extract.py" \
 ## 阶段7：发布飞书文档（评估后必做）
 
 > **第一性原则**：报告躺在 `notes/` 里不算完成——只有到达 HR 屏幕才算闭环。阶段6 分发完本地档位后，**自动**进入阶段7，不等用户问。
+
+**发布前核对（必做，先于一切发布步骤）**：报告名单必须与 `notes/collection_manifest.json` 中 `received_at` 为当日（或本批 {M.DD}）的记录比对——人数、姓名一致才发；不一致先查清差异（多人为历史积压混入目录 / 少人为漏提取），**绝不带着差异发布**。目录名日期与名单口径可能不一致（目录日期段=邮件收到日，见 archive-contract.md），以 manifest 为准。
 
 流程（3 步）：
 1. **预处理**：从 `notes/简历评估_{M.DD}.md` 派生 `notes/_发布版_简历评估_{M.DD}.md`，剔除本地路径、归档说明等噪音

@@ -136,10 +136,10 @@ def cmd_set(args):
 
 def cmd_decide(args):
     """写入 decisions：读输入 JSON 数组，校验枚举，追加（不去重）。"""
-    if not os.path.exists(args.path):
-        print(f"❌ 输入文件不存在: {args.path}")
+    if not os.path.exists(args.path2):
+        print(f"❌ 输入文件不存在: {args.path2}")
         return 1
-    with open(args.path, encoding="utf-8") as f:
+    with open(args.path2, encoding="utf-8") as f:
         raw = json.load(f)
     if not isinstance(raw, list):
         print("❌ 输入必须是 JSON 数组")

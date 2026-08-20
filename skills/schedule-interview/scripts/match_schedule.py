@@ -31,6 +31,8 @@ match_schedule.py — 面试时间协调核心脚本
   python match_schedule.py --interviewer 谢坤 --candidates "罗艺=周四" --duration 45 --work-start 10:00 --work-end 19:00
 """
 
+import os
+
 # === 自动内联的 lark-cli 封装（由 sync_to_opensource.py 从 _lark_shared 抽出，开源版自包含）===
 import subprocess, json, re as _re, os as _os, shutil
 # 凭证走环境变量（见 .env.example），不硬编码
@@ -89,7 +91,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 # 复用项目共享库（收口 cli/extract_json，含 MSYS_NO_PATHCONV + utf-8 encoding + timeout）
 PROJECT_ROOT = os.environ.get("PROJECT_ROOT", os.getcwd())
 CACHE = os.path.join(PROJECT_ROOT, "notes", "interviewers.json")
-ATS_FILE = os.path.join(PROJECT_ROOT, "notes", "_daily_review.json")  # 岗位/进展/轮次的数据源（recruit-followup 产出）
+ATS_FILE = os.path.join(PROJECT_ROOT, "notes", "_daily_review.json")  # 岗位/进展/轮次的数据源（daily-recruit-report 产出）
 
 # 星期映射（周一=0）
 WEEKDAY_MAP = {
@@ -291,9 +293,10 @@ def progress_text(stage, interview_count, latest_conclusion):
 
 
 def build_header(ats_records, form, team_override=None):
-    """构造草稿标题行：{团队}——{岗位}{形式}面试
+    """构造草稿标题行（job_brief 同源）：{团队}——{岗位}
     多人岗位相同时合并写一个岗位；岗位不同时标题只写团队（岗位跟人名走，见候选人块）。
-    团队岗位用"——"间隔（用户明确：长青工作室——3D角色设计师，不要连写）。
+    团队岗位用"——"间隔（2026-08-17 用户定稿后又退回：标题——更自然，块内才用 ｜）。
+    形式（视频/线下）不放标题，下沉到候选人块的"拟安排"行（2026-08-04 起）。
     """
     depts = set()
     jobs = set()
@@ -301,7 +304,7 @@ def build_header(ats_records, form, team_override=None):
         if not a:
             continue
         depts.add(team_override or a.get("dept", ""))
-        jobs.add(a.get("job", ""))
+        jobs.add((a.get("job") or "").strip())
     depts.discard("")
     jobs.discard("")
     if not depts and not jobs:
@@ -311,14 +314,15 @@ def build_header(ats_records, form, team_override=None):
     if len(jobs) == 1:
         job_part = "——" + next(iter(jobs)) if jobs else ""
     elif len(jobs) > 1:
-        # 岗位不同：标题不列具体岗位，岗位跟人名走（候选人块里"姓名（岗位·轮次）"）
+        # 岗位不同：标题不列具体岗位，岗位跟人名走（候选人块里"姓名｜岗位·轮次"）
         job_part = ""
-    return f"{team_part}{job_part}{'视频' if form == '视频' else '线下'}面试"
+    return f"{team_part}{job_part}"
 
 
 def _job_brief(ats_records, team_override=None):
     """草稿开头用的精简描述：{团队}——{岗位}（多人岗位相同合并；岗位不同只写团队，岗位跟人名走）。
-    团队岗位用"——"间隔。开头句已含"沟通了一下时间"，形式后缀放结尾行动召唤更自然。
+    团队岗位用"——"间隔（2026-08-17 标题退回旧版）。形式（视频/线下）下沉到候选人块"拟安排"行，
+    标题不再带形式后缀。
     """
     depts = set()
     jobs = set()
@@ -326,7 +330,7 @@ def _job_brief(ats_records, team_override=None):
         if not a:
             continue
         depts.add(team_override or a.get("dept", ""))
-        jobs.add(a.get("job", ""))
+        jobs.add((a.get("job") or "").strip())
     depts.discard("")
     jobs.discard("")
     if not depts and not jobs:
@@ -340,15 +344,18 @@ def _job_brief(ats_records, team_override=None):
 
 def parse_candidate_time(raw, ref_date=None):
     """
-    解析候选人给的时间，返回 (date_list, time_hint)。
+    解析候选人给的时间，返回 (date_list, day_hints)。
+    - day_hints: {datetime.date: hint_str}  —— 按天的时段偏好，支持"某天带时段"精确表达，
+      不再把单天的时段塌缩成全局（修复 spillover bug）。
     - 支持多个日期：用 `|` 分隔（逗号已被 --candidates 用于分隔候选人）
       "周一周二" → 内部等价 "周一|周二"；"8-3,8-4" 在 --candidates 里会被拆成两个候选人，
       所以多日期必须用 `|`：candidates="张三=8-3|8-4"
-      - "周四"          → ([绝对日期], None)
-      - "周四 16:00"     → ([绝对日期], "16:00")
-      - "周四下午"       → ([绝对日期], "下午")  → 后续映射到 14:00-18:00
-      - "7-3" / "7月3日" → ([绝对日期], None)
-      - "周一周二"       → ([周一, 周二], None)  ← 连续星期词自动拆
+      - "周四"                 → ([绝对日期], {})
+      - "周四 16:00"            → ([绝对日期], {绝对日期: "16:00"})
+      - "周四下午"              → ([绝对日期], {绝对日期: "下午"})
+      - "8-20下午|8-21|8-24"    → ([8-20,8-21,8-24], {8-20: "下午"})  ← 只有 8-20 是下午，其余全天
+      - "7-3" / "7月3日"        → ([绝对日期], {})
+      - "周一周二"              → ([周一, 周二], {周一: None, 周二: None})  ← 连续星期词自动拆
     """
     ref = ref_date or datetime.date.today()
     raw = raw.strip()
@@ -373,36 +380,63 @@ def parse_candidate_time(raw, ref_date=None):
         tm = re.search(r"(\d{1,2}[:：]\d{2}|下午|晚上|上午|早上)", raw)
         if tm:
             time_hint = tm.group(1).replace("：", ":")
-        return list(dict.fromkeys(all_dates)), time_hint
+        # 按天挂时段偏好（连续星期词共享同一时段词）
+        day_hints = {}
+        for d in all_dates:
+            day_hints[d] = time_hint
+        return list(dict.fromkeys(all_dates)), day_hints
 
     # 单日期解析：支持 | 分隔多日期（"8-3|8-4"）
     if "|" in raw:
         subs = [s.strip() for s in raw.split("|")]
         all_dates = []
-        all_hints = []
+        day_hints = {}
         for sub in subs:
-            d, h = parse_candidate_time(sub, ref)
-            all_dates.extend(d)
-            if h:
-                all_hints.append(h)
-        return list(dict.fromkeys(all_dates)), (all_hints[0] if all_hints else None)
+            d_list, h_dict = parse_candidate_time(sub, ref)
+            all_dates.extend(d_list)
+            day_hints.update(h_dict)
+        return list(dict.fromkeys(all_dates)), day_hints
 
     # 提取时间部分（如果有）
     time_hint = None
-    # 优先匹配精确时刻 HH:MM / 时段词 / 时间范围（如"9-11点"）
-    time_match = re.search(r"(\d{1,2}[:：]\d{2}|上午|下午|早上|晚上)", raw)
-    if time_match:
-        time_hint = time_match.group(1).replace("：", ":")
-        date_raw = raw.replace(time_match.group(0), "").strip()
+    has_pm = ("下午" in raw) or ("晚上" in raw)
+    # 先找时间区间 "HH:MM-HH:MM"（如 "14:00-15:00"，AI 由原话"下午2点到3点"转写）——
+    # 必须在单时刻匹配之前，否则只截到起始时刻、区间尾丢失（2026-08-20 新增）
+    rng_match = re.search(r"(\d{1,2}[:：]\d{2})\s*[-~～到]\s*(\d{1,2}[:：]\d{2})", raw)
+    # 再找 "X点(半)?"（精确时刻，如 "4点"/"4点半"）—— 必须在时段词之前，
+    # 否则"今天下午4点"会先命中"下午"导致整点时刻丢失、time_hint 变成时段词
+    hm_match = None if rng_match else re.search(r"(\d{1,2})点(半)?", raw)
+    if rng_match:
+        time_hint = rng_match.group(1).replace("：", ":") + "-" + rng_match.group(2).replace("：", ":")
+        date_raw = raw.replace(rng_match.group(0), "").strip()
+    elif hm_match:
+        hh = int(hm_match.group(1))
+        mm = 30 if hm_match.group(2) else 0
+        if has_pm and hh < 12:
+            hh += 12
+        time_hint = f"{hh:02d}:{mm:02d}"
+        date_raw = raw.replace(hm_match.group(0), "").strip()
     else:
-        # 时间范围如"9-11点"——取起始小时做 time_hint，避免被月日正则误匹配成"9月11日"
-        range_match = re.search(r"(\d{1,2})[-~～到](\d{1,2})\s*点", raw)
-        if range_match:
-            start_h = int(range_match.group(1))
-            time_hint = f"{start_h:02d}:00"
-            date_raw = raw.replace(range_match.group(0), "").strip()
+        # 再找精确 HH:MM
+        mm_match = re.search(r"(\d{1,2}[:：]\d{2})", raw)
+        if mm_match:
+            time_hint = mm_match.group(1).replace("：", ":")
+            date_raw = raw.replace(mm_match.group(0), "").strip()
         else:
-            date_raw = raw
+            # 纯时段词（上午/下午/早上/晚上）
+            pw_match = re.search(r"(上午|下午|早上|晚上)", raw)
+            if pw_match:
+                time_hint = pw_match.group(1)
+                date_raw = raw.replace(pw_match.group(0), "").strip()
+            else:
+                # 时间范围如"9-11点"——取起始小时做 time_hint，避免被月日正则误匹配成"9月11日"
+                range_match = re.search(r"(\d{1,2})[-~～到](\d{1,2})\s*点", raw)
+                if range_match:
+                    start_h = int(range_match.group(1))
+                    time_hint = f"{start_h:02d}:00"
+                    date_raw = raw.replace(range_match.group(0), "").strip()
+                else:
+                    date_raw = raw
 
     # 解析日期
     dates = []
@@ -437,7 +471,13 @@ def parse_candidate_time(raw, ref_date=None):
 
     if not dates:
         print(f"[⚠️ 解析失败] 无法识别日期: {raw}")
-    return dates, time_hint
+    # 返回按天的时段偏好字典（单日期场景：最多 1 个日期）。
+    # ⚠️ 无时段词的天也要入字典（值为 None=全天），否则多日期聚合后这些天没有 date 对象，
+    #    后续「相邻全天合并」等按天逻辑会因 d_obj=None 而失效。
+    day_hints = {}
+    if dates:
+        day_hints[dates[0]] = time_hint
+    return dates, day_hints
 
 
 def _parse_iso(s):
@@ -571,10 +611,13 @@ def get_freebusy_blocks(oids, start_iso, end_iso, labels=None):
     return blocks, busy_by_date, lunch_busy
 
 
-def intersect(candidate_date, time_hint, blocks, duration_min, work_start=9, work_end=18):
+def intersect(candidate_date, time_hint, blocks, duration_min, work_start=9, work_end=18, now=None):
     """
     把候选人的候选日（+可选时段偏好）和空闲块求交，输出可约的具体时刻列表。
     返回 [{"time": "HH:MM", "label": "..."}, ...]
+
+    now: 当前时间（含时区）。当 candidate_date == now.date()（即今天）时，
+    会把已经过去的时段剔除，避免把"今天上午11点"这种过期时点排成面试建议。
     """
     avail_slots = []
     for b in blocks:
@@ -590,6 +633,15 @@ def intersect(candidate_date, time_hint, blocks, duration_min, work_start=9, wor
         win_end = datetime.datetime(day.year, day.month, day.day, work_end, 0, tzinfo=TZ)
         slot_start = max(b["start"], win_start)
         slot_end = min(b["end"], win_end)
+        # 2026-08-19 修：今天已过的时段直接剔除。
+        # 对齐到下一个 30 分钟边界，避免建议"现在4分钟后"这种非整点时点。
+        if now is not None and candidate_date == now.date():
+            floor_min = ((now.hour * 60 + now.minute) // 30 + 1) * 30
+            if floor_min >= 24 * 60:
+                # 今天已无剩余 30 分钟边界（接近午夜），整段跳过
+                continue
+            floor = now.replace(hour=floor_min // 60, minute=floor_min % 60, second=0, microsecond=0)
+            slot_start = max(slot_start, floor)
         if slot_end <= slot_start:
             continue
         # 切档（每 30 分钟一档，找够 duration_min 的）
@@ -597,10 +649,32 @@ def intersect(candidate_date, time_hint, blocks, duration_min, work_start=9, wor
         while cur + datetime.timedelta(minutes=duration_min) <= slot_end:
             avail_slots.append(cur.strftime("%H:%M"))
             cur += datetime.timedelta(minutes=30)
+        # 精确时刻偏好（2026-08-18 新增）：若候选人给的整点时刻（如 16:00）落在本空闲段内（够 duration），
+        # 直接纳入候选——避免紧贴会尾时只能给 4:15 而非候选人要的 4:00
+        # （区间窗口 "14:00-15:00" 不走这里：起点已在 30 分钟网格上，且过滤段已保证整段落在窗口内）
+        if time_hint and ":" in time_hint and "-" not in time_hint:
+            th, tm = map(int, time_hint.split(":"))
+            target = datetime.datetime(day.year, day.month, day.day, th, tm, tzinfo=TZ)
+            # 今天给的精确时刻若已过期，不纳入候选
+            expired = now is not None and candidate_date == now.date() and target < now
+            if not expired and slot_start <= target and target + datetime.timedelta(minutes=duration_min) <= slot_end:
+                ts = target.strftime("%H:%M")
+                if ts not in avail_slots:
+                    avail_slots.append(ts)
 
     # 应用 time_hint 过滤
     if time_hint:
-        if ":" in time_hint:
+        if "-" in time_hint and ":" in time_hint:
+            # 时间区间窗口（如 "14:00-15:00"，候选人原话"下午2点到3点"）：档位必须完整落在窗口内
+            # —— slot >= 起点 且 slot + 时长 <= 终点，杜绝建议跑出候选人窗口（2026-08-20 新增）
+            m = re.match(r"(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})", time_hint)
+            if m:
+                s_min = int(m.group(1)) * 60 + int(m.group(2))
+                e_min = int(m.group(3)) * 60 + int(m.group(4))
+                avail_slots = [s for s in avail_slots
+                               if int(s[:2]) * 60 + int(s[3:5]) >= s_min
+                               and int(s[:2]) * 60 + int(s[3:5]) + duration_min <= e_min]
+        elif ":" in time_hint:
             # 精确时刻：找最接近的
             target_h, target_m = [int(x) for x in time_hint.split(":")]
             avail_slots = [s for s in avail_slots if int(s[:2]) >= target_h]
@@ -642,12 +716,15 @@ def _slot_priority(time_str):
 def best_slot(avail, time_hint=None):
     """从可选时段里挑最佳。
     - time_hint 是精确时刻（HH:MM）→ 优先选离该时刻最近的（尊重候选人明确给的时间点）
+    - time_hint 是区间窗口（HH:MM-HH:MM）→ 取窗口起点做偏好时刻（2026-08-20 新增）
     - 否则 → 面试黄金时段优先（11点/下午3-6点）
     """
     if not avail:
         return None
     if time_hint and ":" in time_hint:
-        target_h, target_m = [int(x) for x in time_hint.split(":")]
+        # 区间窗口取起点（"14:00-15:00"→14:00）；纯时刻直接用
+        target = time_hint.split("-")[0]
+        target_h, target_m = [int(x) for x in target.split(":")]
         target_minutes = target_h * 60 + target_m
         return min(avail, key=lambda s: abs(int(s[:2]) * 60 + int(s[3:5]) - target_minutes))
     return min(avail, key=_slot_priority)
@@ -672,6 +749,91 @@ def time_cn(time_str):
         return f"{period}{h12}点半"
     else:
         return f"{period}{h12}点{m:02d}分"
+
+
+def time_bare(time_str):
+    """'HH:MM' → 去时段词的中文时刻：'4点' / '4点15分' / '11点' / '3点半'。
+    用于近时间相对词已带「下午/上午」时，避免「今天下午下午4点」这种重复。"""
+    h, m = int(time_str[:2]), int(time_str[3:5])
+    h12 = h % 12
+    if h12 == 0:
+        h12 = 12
+    if m == 0:
+        return f"{h12}点"
+    elif m == 30:
+        return f"{h12}点半"
+    else:
+        return f"{h12}点{m:02d}分"
+
+
+def _window_label(hint, work_start=9, work_end=18):
+    """把候选人的时段偏好词映射成草稿「可面时间」里可见的具体窗口文字。
+    - None        → 全天（工作时段，如 09:00-18:00）
+    - "下午"       → 下午（13:00-{work_end}）   ← 与 intersect 的下午过滤（>=13:00）对齐
+    - "晚上"       → 晚上（17:00-{work_end}）
+    - "上午"       → 上午（09:00-12:00）
+    - "早上"       → 早上（09:00-10:00）
+    - "HH:MM"      → 约HH:MM（候选人给了精确时刻）
+    - "HH:MM-HH:MM" → 原样展示（候选人给了时间区间窗口，如"下午2点到3点"）
+    这样「可面时间」每行都写明具体时段，不再靠一个全局时段词含糊带过。"""
+    if not hint:
+        return f"全天（{work_start:02d}:00-{work_end:02d}:00）"
+    if hint == "下午":
+        return f"下午（13:00-{work_end:02d}:00）"
+    if hint == "晚上":
+        return f"晚上（17:00-{work_end:02d}:00）"
+    if hint == "上午":
+        return "上午（09:00-12:00）"
+    if hint == "早上":
+        return "早上（09:00-10:00）"
+    if "-" in hint and ":" in hint:
+        return hint
+    if ":" in hint:
+        return f"约{hint}"
+    return hint
+
+
+def extract_rel_term(raw, today):
+    """从候选时间原文提取近时间相对词（今天/明天/后天 + 上午/下午/早上/晚上）。
+    返回 (rel_term, rel_date)：如 ('今天下午', date) / ('明天', tomorrow) / ('', None)。
+    仅近时间（今天/明天/后天）保留；周X/绝对日期不保留（按旧规则转绝对日期，避免歧义）。"""
+    day_word, rel_date = "", None
+    if "今天" in raw:
+        day_word, rel_date = "今天", today
+    elif "明天" in raw:
+        day_word, rel_date = "明天", today + datetime.timedelta(days=1)
+    elif "后天" in raw:
+        day_word, rel_date = "后天", today + datetime.timedelta(days=2)
+    if not day_word:
+        return "", None
+    period = next((pw for pw in ("上午", "下午", "早上", "晚上") if pw in raw), "")
+    return day_word + period, rel_date
+
+
+def auto_rel_term(d, today):
+    """日期==运行日/次日时返回'今天'/'明天'，其余返回 ''。
+    2026-08-20 用户定稿：原话没写相对词（AI 传的是绝对日期）也按日期自动补标注——
+    面试官当天读草稿不用心算"周四是哪天"；绝对日期仍保留在前面，延迟阅读不误导。"""
+    if d is None or today is None:
+        return ""
+    delta = (d - today).days
+    if delta == 0:
+        return "今天"
+    if delta == 1:
+        return "明天"
+    return ""
+
+
+def _ds_to_date(ds, today):
+    """hits 里的日期串 'M-D'（无年份）→ date 对象。年份取运行年，12月查1月时 +1。
+    2026-08-20 修：拟安排行的日期比较曾用 (yy,mm,dd)=map(int,'8-20') 的错误拆法
+    （year=8、month=20 直接 ValueError 被吞，相对词贴拟安排从未生效），统一走本函数。"""
+    try:
+        mm, dd = map(int, ds.split("-"))
+        year = today.year + (1 if (today.month == 12 and mm == 1) else 0)
+        return datetime.date(year, mm, dd)
+    except Exception:
+        return None
 
 
 def weekday_cn(d):
@@ -887,6 +1049,7 @@ def main():
         args.form = "线下"
 
     today = datetime.date.today()
+    now = datetime.datetime.now(TZ)  # 2026-08-19 修：供 intersect 过滤"今天已过时段的建议"
     work_start = int(args.work_start.split(":")[0])
     work_end = int(args.work_end.split(":")[0])
 
@@ -930,7 +1093,9 @@ def main():
             raw_time, role = raw_time.rsplit("@", 1)
             role = role.strip()
         raw_time = raw_time.strip()
-        dates, time_hint = parse_candidate_time(raw_time, today)
+        dates, day_hints = parse_candidate_time(raw_time, today)
+        # 近时间相对词提取（今天/明天/后天+上午/下午）→ 草稿保留"今天下午"等措辞（2026-08-18 新增）
+        rel_term, rel_date = extract_rel_term(raw_time, today)
         # 周末告警（不强制排除，业务上偶尔有周末面试）：让用户看到"这是周末"再决定
         for d in dates:
             if d.weekday() >= 5:  # 5=周六, 6=周日
@@ -940,10 +1105,11 @@ def main():
         tid = talent_ids[idx] if idx < len(talent_ids) else ""
         ats = match_ats(name, tid, by_tid, by_name)
         candidates.append({
-            "name": name, "dates": dates, "time_hint": time_hint, "raw": raw_time,
+            "name": name, "dates": dates, "day_hints": day_hints, "raw": raw_time,
             "role": role,  # @后的岗位方向（草稿展示用，可选）
             "form": form_override or args.form,  # #后的形式覆盖（可选，无则用全局 --form）
             "talent_id": tid, "ats": ats,
+            "rel_term": rel_term, "rel_date": rel_date,  # 近时间相对词（草稿保留用，2026-08-18 新增）
         })
 
     if args.dry_run:
@@ -956,7 +1122,7 @@ def main():
             ats = c.get("ats") or {}
             ats_str = f" ATS={ats.get('job','?')}/{ats.get('stage','?')}/面{ats.get('interview_count','?')}" if ats else " ATS=【缺】"
             tid_str = f" tid={c['talent_id']}" if c["talent_id"] else ""
-            print(f"  {c['name']}{role_tag}{form_tag}{tid_str}{ats_str}: 日期={[weekday_cn(d)+str(d) for d in c['dates']]}, 时段偏好={c['time_hint']}")
+            print(f"  {c['name']}{role_tag}{form_tag}{tid_str}{ats_str}: 日期={[weekday_cn(d)+str(d) for d in c['dates']]}, 时段偏好={c['day_hints']}")
         return
 
     # ③ 查面试官共同空闲（覆盖所有候选人提到的日期 + 未来 N 天）
@@ -986,7 +1152,12 @@ def main():
     lines_result = []
     # 按候选人聚合：{name: {raw, role, hits: [(wd, date_str, suggest, room_line), ...]}}
     cand_matches = {}
-    c_time_hint = {c["name"]: c["time_hint"] for c in candidates}  # name -> 时段偏好（"下午"/"16:00"等）
+    # name -> {date: 时段偏好}（按天，不再全局塌缩）
+    # 2026-08-20 修：同名多条目必须合并而非覆盖——dict comprehension 后条目把前条目整表冲掉，
+    # "8-20 14:00" 的 hint 被 "8-21" 的 {8-21:None} 覆盖 → 草稿窗口把 8-20 显示成全天
+    c_day_hints = {}
+    for c in candidates:
+        c_day_hints.setdefault(c["name"], {}).update(c["day_hints"])
     occupied = set()  # 已分配给前面候选人的 (date, time)，避免同一面试官撞档
     per_day_count = {}  # date -> 已分配场数（--max-per-day 密度约束：用户"别排太密"偏好）
     assigned_once = {}  # name -> bool：每候选人只算拟安排（首次分配）的日期计入密度；同名条目的兜底备选日期不算
@@ -996,14 +1167,14 @@ def main():
             # 每天容量上限：该日期已满 → 跳过（候选人顺延到后续日期，草稿窗口仍完整展示可约日期）
             if args.max_per_day and per_day_count.get(d, 0) >= args.max_per_day:
                 continue
-            slots = intersect(d, c["time_hint"], blocks, args.duration, work_start, work_end)
+            slots = intersect(d, c["day_hints"].get(d), blocks, args.duration, work_start, work_end, now)
             # 排除已被其他候选人占用的时段（按 30 分钟对齐，duration 内不能重叠）
             avail = [s for s in slots if not _has_conflict(d, s, args.duration, occupied)]
             wd = weekday_cn(d)
             date_str = f"{d.month}-{d.day}"
             if avail:
                 # 建议策略：候选人有精确时刻→贴他给的时间点；否则→面试黄金时段（11点/下午3-6点）
-                suggest = best_slot(avail, c["time_hint"])
+                suggest = best_slot(avail, c["day_hints"].get(d))
                 room_line = ""
                 if not args.no_room:
                     # 会议室是面试官侧的场地硬约束：视频面试面试官也在公司会议室里，同样要订会议室。
@@ -1072,7 +1243,7 @@ def main():
         [name_to_ats.get(n) for n in matched],
         args.form, args.team,
     )
-    header_line = header or f"【需问用户：团队+岗位】{args.form}面试"
+    header_line = header or f"【需问用户：团队+岗位】"
 
     # 面试官称谓：缓存里 alias[0] 或姓名（草稿抬头用，alias 如 Sava=古振兴）
     iv_alias = ""
@@ -1082,11 +1253,21 @@ def main():
             break
     salutation = iv_alias or interviewer_names[0]
 
+    def _rel_of(name):
+        """取候选人近时间相对词（今天/明天/后天+上午/下午）及对应绝对日期，找不到返回 ('', None)。"""
+        for c in candidates:
+            if c["name"] == name:
+                return c.get("rel_term", ""), c.get("rel_date")
+        return "", None
+
     def _candidate_block(name, role_hint, raw, hits, ats, form_cn):
-        """单人块（多日期聚合版）：
-        姓名（岗位·轮次）：
-        面试可以时间：8/4（周二）全天、8/5（周三）   ← 完整可约窗口 + 时段偏好
-        拟安排：8/4（周二）下午4点（视频），会议室：XX  ← 最优时段 + 形式 + 会议室
+        """单人块（多日期聚合版），2026-08-17 模板定稿 + 2026-08-20 排版定稿：
+        - 三行各自独立成行（姓名行 / 可面时间行 / 拟安排行，不再挤成一段）
+        - 可面时间、拟安排两行缩进一个全角空格（≈两格，2026-08-20 用户定稿"中间缩进两格"：层次更清晰）
+        - 近时间相对词保留进草稿（如「今天下午」）；原话没写时日期==运行日/次日自动补「今天/明天」
+        姓名｜岗位·轮次
+        　可面时间：8/18（周二）今天下午（16:00）
+        　拟安排：8/18（周二）今天下午4点（线下）
         hits: [(wd, date_str, suggest, room_line), ...] 按优先级排序，第一个是最优
         """
         ats = ats or {}
@@ -1094,7 +1275,7 @@ def main():
             ats.get("stage"), ats.get("interview_count"), ats.get("latest_conclusion"),
         )
         # 括号内容：岗位·轮次（岗位从 ATS 取，轮次从 ATS 推；ATS 缺时用 role_hint 兜底）
-        job = ats.get("job", "")
+        job = (ats.get("job") or "").strip()
         role_tag = round_role or role_hint
         if job and role_tag:
             paren = f"{job}·{role_tag}"
@@ -1104,23 +1285,81 @@ def main():
             paren = role_tag
         else:
             paren = ""
-        head = f"{name}（{paren}）：" if paren else f"{name}："
-        # 完整可约窗口：所有命中日期的绝对日期（去重保序），带时段偏好
-        time_pref = c_time_hint.get(name, "")
-        date_parts = []
+        head = f"{name}｜{paren}" if paren else f"{name}"
+        # 近时间相对词：仅贴到对应绝对日期（今天/明天/后天 各指一天，避免错贴到其它日期）
+        rel_term, rel_date = _rel_of(name)
+
+        # 完整可约窗口：按天展示具体时段（修复 spillover bug）；
+        # B 方案呈现：相邻「全天」合并成一段（~ 连接），跨「工作日↔周末」边界时断开；
+        # 带具体时段（下午/上午/精确时刻）的单独成行，不并入全天合并。
+        day_hints_for_name = c_day_hints.get(name, {})
+        hint_by_ds = {f"{dd.month}-{dd.day}": (dd, h) for dd, h in day_hints_for_name.items()}
+
+        # 构造有序 item 列表（hits 已按优先级排序）
+        items = []
         for wd, ds, t, room_line in hits:
-            d_str = ds.replace("-", "/") + "（" + wd + "）"
-            date_parts.append(d_str)
-        window = "、".join(dict.fromkeys(date_parts))
-        if time_pref:
-            window = f"{window}（{time_pref}）"
-        elif len(hits) == 1:
-            # 单个日期且候选人没说时段 → 标"全天"（方便面试官知道窗口是整天）
-            window = f"{window}全天"
-        # 拟安排：第一个命中（优先级最高），标形式（视频/现场）
+            d_obj, hint = hint_by_ds.get(ds, (None, None))
+            rel_applied = False
+            if rel_term and rel_date is not None and d_obj is not None:
+                try:
+                    if (d_obj.year, d_obj.month, d_obj.day) == (rel_date.year, rel_date.month, rel_date.day):
+                        rel_applied = True
+                except Exception:
+                    pass
+            # 原话没带相对词（AI 传绝对日期）时，日期==运行日/次日自动补「今天/明天」（2026-08-20 定稿）
+            rel_show = rel_term if rel_applied else auto_rel_term(d_obj, today)
+            items.append({"ds": ds, "wd": wd, "d": d_obj, "hint": hint, "rel": rel_show})
+
+        def _is_we(d):
+            return bool(d) and d.weekday() >= 5
+
+        def _consec(a, b):
+            return bool(a) and bool(b) and (b - a).days == 1
+
+        parts = []
+        i, n = 0, len(items)
+        while i < n:
+            it = items[i]
+            if it["hint"]:
+                # 带具体时段（下午/上午/精确时刻）→ 单独一行
+                d_str = it["ds"].replace("-", "/") + "（" + it["wd"] + "）" + it["rel"]
+                parts.append(d_str + _window_label(it["hint"], work_start, work_end))
+                i += 1
+            else:
+                # 全天：贪心合并连续日历日，且跨「工作日↔周末」边界时断开
+                run = [it]
+                j = i + 1
+                while j < n and (not items[j]["hint"]) and _consec(run[-1]["d"], items[j]["d"]) \
+                        and _is_we(run[-1]["d"]) == _is_we(items[j]["d"]):
+                    run.append(items[j])
+                    j += 1
+                if len(run) == 1:
+                    r = run[0]
+                    d_str = r["ds"].replace("-", "/") + "（" + r["wd"] + "）" + r["rel"]
+                    parts.append(d_str + _window_label(None, work_start, work_end))
+                else:
+                    a, b = run[0], run[-1]
+                    d_str = (a["ds"].replace("-", "/") + "（" + a["wd"] + "）~ "
+                             + b["ds"].replace("-", "/") + "（" + b["wd"] + "）")
+                    parts.append(d_str + _window_label(None, work_start, work_end))
+                i = j
+        window = "、".join(parts)
+        # 拟安排：第一个命中（优先级最高），标形式（视频/现场）+ 相对词
         wd0, ds0, t0, room_line0 = hits[0]
-        abs_suggest = ds0.replace("-", "/") + "（" + wd0 + "）" + time_cn(t0) + f"（{form_cn}）" + room_line0
-        return f"{head}\n面试可以时间：{window}\n拟安排：{abs_suggest}"
+        d0 = _ds_to_date(ds0, today)
+        show_rel = ""
+        if rel_term and rel_date is not None and d0 is not None and d0 == rel_date:
+            show_rel = rel_term
+        # 原话没带相对词时，拟安排日期==运行日/次日自动补「今天/明天」（2026-08-20 定稿）
+        if not show_rel:
+            show_rel = auto_rel_term(d0, today)
+        # 原话相对词已带时段（如「今天下午」）→ 时刻去时段词（time_bare），避免「今天下午下午4点」；
+        # 自动补的「今天/明天」不带时段 → 保留 time_cn 的上午/下午，避免「今天3点」歧义
+        time_part = (time_bare(t0) if any(p in show_rel for p in ("上午", "下午", "早上", "晚上"))
+                     else time_cn(t0)) if show_rel else time_cn(t0)
+        abs_suggest = ds0.replace("-", "/") + "（" + wd0 + "）" + show_rel + time_part + f"（{form_cn}）" + room_line0
+        # 布局：三行各自独立；可面时间/拟安排缩进一个全角空格（≈两格，2026-08-20 用户定稿"中间缩进两格"）
+        return f"{head}\n　可面时间：{window}\n　拟安排：{abs_suggest}"
 
     def _summary_phrase(names, name_to_ats):
         """从匹配成功的候选人列表提炼'是谁、推进几面'的概述。
@@ -1144,10 +1383,6 @@ def main():
             parts.append(f"{'、'.join(names_grp)}推进{role}")
         return "，".join(parts)
 
-    # 候选人 form 集合（per-candidate 覆盖生效时用）
-    cand_forms = {c.get("form", args.form) for c in candidates}
-    mixed_form = len(cand_forms) > 1
-
     if len(matched) == 1:
         name = matched[0]
         m = cand_matches[name]
@@ -1168,7 +1403,7 @@ def main():
         draft = (
             f"{salutation}，{job_brief}，{summary}，我和候选人沟通了一下面试时间：\n\n"
             f"{block}{need_user}\n\n"
-            f"看看这个{form_cn}面试时间可以的话我去敲定{room_tail}。"
+            f"时间OK的话我直接和候选人敲定～"
         )
     else:
         # 多人：称谓 → 这是谁/推进几面 → 我沟通了时间 → 具体安排
@@ -1198,16 +1433,10 @@ def main():
         job_brief = _job_brief([name_to_ats.get(n) for n in matched_sorted], args.team) or header_line
         # 会议室信息不展示在草稿尾部（2026-08-04 用户定稿：有会议室就别提，只在无可用时另行告警）
         room_tail = ""
-        if mixed_form:
-            # 混合形式（有人视频有人线下）：结尾不带形式词
-            tail = f"这几个面试时间都避开了你日程上的会议{room_tail}，看看可以的话我去敲定。"
-        else:
-            tail_form_cn = "视频" if args.form == "视频" else "线下"
-            tail = f"这几个{tail_form_cn}面试时间都避开了你日程上的会议{room_tail}，看看可以的话我去敲定。"
         draft = (
             f"{salutation}，{job_brief}，{summary}，我和候选人沟通了一下面试时间：\n\n"
             f"{body}\n\n"
-            f"{tail}"
+            f"时间OK的话我直接和候选人敲定～"
         )
 
     # ⑥ stdout 直出（删 _schedule_match.txt——git-bash UTF-8 不乱码，AGENTS.md 已确认）

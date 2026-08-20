@@ -114,11 +114,16 @@ def extract(path):
     return text, True, None
 
 
-def render_pages(pdf_path, output_dir=None, dpi=RENDER_DPI):
-    """把 PDF 每页渲染成 PNG 图片（绕过 BOSS 文本层加密的 fallback）。
+def render_pages(pdf_path, output_dir=None, dpi=RENDER_DPI, max_pages=8):
+    """把 PDF 渲染成 PNG 图片（绕过 BOSS 文本层加密的 fallback）。
 
     返回图片路径列表。output_dir 不传时用临时目录。
     图片命名：p{页码}.png（1-based）。
+
+    2026-08-14 性能改造：**只渲染前 max_pages 页（默认 8）**——BOSS 加密简历的
+    核心信息（基本信息/求职意向/工作经历）都在前几页，后面几十页是作品集，
+    不需要渲染判断档位。79 页的曹语录作品集从 79 张 200dpi 大图降到 8 张，
+    渲染耗时降 90%+。需要看全页作品集时再单独渲染。
     """
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -126,13 +131,17 @@ def render_pages(pdf_path, output_dir=None, dpi=RENDER_DPI):
         output_dir = tempfile.mkdtemp(prefix="_extract_render_")
 
     doc = fitz.open(pdf_path)
+    total = len(doc)
+    n = min(total, max_pages)
     paths = []
-    for i, page in enumerate(doc):
-        pix = page.get_pixmap(dpi=dpi)
+    for i in range(n):
+        pix = doc[i].get_pixmap(dpi=dpi)
         fp = os.path.join(output_dir, f"p{i+1}.png")
         pix.save(fp)
         paths.append(fp)
     doc.close()
+    if total > n:
+        print(f"  ⚠️ PDF 共 {total} 页，仅渲染前 {n} 页（作品集部分如需评估单独渲染）", file=sys.stderr)
     return paths
 
 

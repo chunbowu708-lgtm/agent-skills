@@ -50,7 +50,7 @@ grep -rnE "cli_[a-zA-Z0-9]{16}|oc_[a-f0-9]{20}|KRAQ[A-Za-z0-9]+|tbl[A-Za-z0-9]{1
 type: feat / fix / docs / refactor / chore
 ```
 
-示例：`feat(recruit-followup): 支持 combined_create 附件自动解析`
+示例：`feat(daily-recruit-report): 支持 combined_create 附件自动解析`
 
 ## License
 

@@ -1,6 +1,6 @@
 # signals-contract.md — 信号与决策 JSON 数据契约
 
-> 生产者：Agent（recruit-followup 早晨对账时执行判读）+ `signals.py` 工具落盘（recruit-followup/scripts/signals.py）
+> 生产者：Agent（daily-recruit-report 早晨对账时执行判读）+ `signals.py` 工具落盘（daily-recruit-report/scripts/signals.py）
 > 产物：`<PROJECT_ROOT>/notes/_signals.json`
 > 消费者：candidate-nurture（交叉比对预警数据 + 保温状态，产出保温清单）
 >
@@ -21,9 +21,9 @@
 |---|---|
 | 路径 | `notes/_signals.json`（项目根相对） |
 | 生成方式 | `signals.py --set/--decide`（Agent 判读后写临时 JSON，工具自动补 talent_id + 校验 + 原子写） |
-| 生成时机 | recruit-followup 早晨对账 step 3.5（判读完 raw_messages 后）+ step 4.5（用户决策后） |
+| 生成时机 | daily-recruit-report 早晨对账 step 3.5（判读完 raw_messages 后）+ step 4.5（用户决策后） |
 | 新鲜度 | 顶层 `date`（YYYY-MM-DD）；消费者用前校验 `date == 今天`，过期提示重跑 |
-| 不存在时 | candidate-nurture **拒绝执行**（前置 gate 失败，不产出清单），引导用户先完成 recruit-followup 早晨对账 |
+| 不存在时 | candidate-nurture **拒绝执行**（前置 gate 失败，不产出清单），引导用户先完成 daily-recruit-report 早晨对账 |
 
 ## 顶层结构
 
@@ -64,7 +64,7 @@
 | `name` | string | 候选人姓名 |
 | `type` | string | 信号类型：`invite`（邀约）/ `reject`（拒绝）/ `hold`（暂缓）/ `discuss`（讨论噪声） |
 | `source` | string | 消息来源（群名/私聊对象，对应 `_daily_review.json` 的 `raw_messages[].source`） |
-| `evidence` | string | **原文片段，不是摘要**——用引号摘录关键句（`「...」`），带精确时间戳+sender。每个事实必须能在 `raw_messages`/`hire_bot_events` 倒查到字面原文。禁止概括/转述/揉合多天事件。判读产出前自检见 `recruit-followup/SKILL.md`「判读产出前自检」（真相源） |
+| `evidence` | string | **原文片段，不是摘要**——用引号摘录关键句（`「...」`），带精确时间戳+sender。每个事实必须能在 `raw_messages`/`hire_bot_events` 倒查到字面原文。禁止概括/转述/揉合多天事件。判读产出前自检见 `daily-recruit-report/SKILL.md`「判读产出前自检」（真相源） |
 | `time` | string | 消息时间（对应 `raw_messages[].time`，人类可读格式）。跨天事件分别列各自时间戳，不用"今天/此前"等模糊词 |
 | `ats_landed` | bool | 是否已落地到 ATS。**必须实查 `structured.ats`**（按 name/talent_id 比对有无记录），不靠推断 |
 
@@ -77,7 +77,7 @@
 | `hold` | 业务方暂缓 | "先看看/等一下/后面再说" | 轻量保温，不催 |
 | `discuss` | 讨论性消息 | 不含明确邀约/拒绝/暂缓意图 | 忽略（不进 signals，或 type=discuss 时 consumer 跳过） |
 
-> **判读规则**：见 `recruit-followup/SKILL.md`「信号判读规则（该 AI 的地方）」节（真相源）——拆句判读、不用关键词、注意隐藏邀约和拒绝话术。只记录 A 类（业务方邀约）和 B 类（Bruce @吴春波 + 明确动词）信号，噪声不记。
+> **判读规则**：见 `daily-recruit-report/SKILL.md`「信号判读规则（该 AI 的地方）」节（真相源）——拆句判读、不用关键词、注意隐藏邀约和拒绝话术。只记录 A 类（业务方邀约）和 B 类（Bruce @吴春波 + 明确动词）信号，噪声不记。
 
 ## decisions.* 字段
 
@@ -105,14 +105,14 @@
 | 消费者 | 读什么 | 不许做什么 |
 |---|---|---|
 | candidate-nurture | `signals`（未落地邀约+拒绝信号）+ `decisions`（用户决策） | 不重新判读 raw_messages、不写 signals/decisions |
-| recruit-followup 日报 | `signals`（引用判读结果） | 不写 decisions（那是用户审查后才写的） |
+| daily-recruit-report 日报 | `signals`（引用判读结果） | 不写 decisions（那是用户审查后才写的） |
 
 ## 写权方
 
 | 部分 | 写权方 | 时机 |
 |---|---|---|
-| `signals` | `signals.py --set`（Agent 判读结果，recruit-followup step 3.5） | LLM 判读完 raw_messages 后立即写 |
-| `decisions` | `signals.py --decide`（Agent 传递用户决策，recruit-followup step 4.5） | 用户审查作战清单并做决策后写 |
+| `signals` | `signals.py --set`（Agent 判读结果，daily-recruit-report step 3.5） | LLM 判读完 raw_messages 后立即写 |
+| `decisions` | `signals.py --decide`（Agent 传递用户决策，daily-recruit-report step 4.5） | 用户审查作战清单并做决策后写 |
 | 整文件 | `signals.py` 工具 | 每天早晨覆盖写 signals（`--set` 保留 decisions）；`--decide` 只改 decisions |
 
 > **注意**：`_signals.json` 是**当天有效**的快照，不跨天累积。历史的 signals 不需要保留（它们要么变成了 ATS 记录，要么已经失效）。如果需要历史追溯，查 `notes/history/` 下的快照（如果未来加入归档）。
@@ -123,7 +123,7 @@
 |---|---|---|
 | 生产者 | 脚本（`_daily_review.py`） | Agent（LLM 判读 + 用户决策） |
 | 数据性质 | 确定性计算（谁卡几天、谁欠面评） | 意图判读（谁被邀约了、谁被拒绝了） + 人工决策 |
-| 数据来源 | ATS API + 跟踪表 + 飞书日程 + 消息原文 | Agent 对 `raw_messages` 的 LLM 判读 + 用户审查后的决策 |
+| 数据来源 | ATS API + 飞书日程 + 消息原文 | Agent 对 `raw_messages` 的 LLM 判读 + 用户审查后的决策 |
 | 新鲜度依赖 | 独立（脚本自己拉数据） | 依赖 `_daily_review.json` 的 `raw_messages`（先有对账才能判读） |
 | candidate-nurture 消费 | `structured.stuck/feedback_overdue/to_advance` | `signals` + `decisions` |
 | 不存在时 | nurture 拒绝运行（前置条件） | nurture 拒绝运行（前置条件，见 candidate-nurture SKILL.md 顶部 gate） |

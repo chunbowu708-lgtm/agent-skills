@@ -5,7 +5,7 @@ description: >
   触发词：收简历、整理简历、处理简历、下载简历、分类简历。
   只要用户提到简历、邮箱、候选人、作品集、归档，就使用这个skill。
   覆盖：标准附件下载、链接类附件（QQ超大附件/云盘）、美术岗作品集打包、多附件合并。
-  不覆盖：Bitable写入、BOSS直聘打招呼（见boss-recruit skill）、群聊文件简历（走 recruit-followup 的 _hire.py --by-name 级联下载）。
+  不覆盖：Bitable写入、BOSS直聘打招呼（见boss-recruit skill）、群聊文件简历（走 candidate-entry 的 _hire.py --by-name 级联下载）。
   依赖：lark-cli（mail 域已授权，不查 auth）、node v24+、Python + PyMuPDF + python-docx + easyocr（图片型PDF）、Playwright（链接类附件，装在 <PROJECT_ROOT>/node_modules）。**Python 用项目 venv**（`python`，collect.mjs 自动探测，`PYTHON` 环境变量可覆盖）；`.doc` 转 PDF 需要本机 Word/WPS（Word COM）或 LibreOffice（soffice），无需 antiword。
 ---
 
@@ -91,9 +91,9 @@ collect 只自动处理"唯一匹配"，以下决策归 Agent/用户：
 | 2 核查 | `node "…/scripts/verify_mails.mjs" [--date 8.14] [--force]` | 增量（已核查邮件跳过）；`--date` 按邮件收到日过滤；`--force` 全量重拉。通知邮件**不按关键词丢弃**。存量记录自动回填 `received_at` 和 `subject`（按快照邮件）。链接提取覆盖：闭合/无闭合 `<a>`、纯文本裸 URL、img src；兜底关键词含网盘/下载/链接/主页 |
 | 3 解析 | `node "…/scripts/resolve_records.mjs" --auto [--dry-run] [--force]` | 附件类从文件名、**链接类从邮件主题**（「姓名-岗位」模式）提取岗位+姓名，唯一匹配才落盘；歧义保留 needs_resolution。目标目录日期段默认=该记录邮件收到日（`--date` 仅人工显式覆盖）。`--dry-run` 先预览。**失败有缓存**：失败过的不再重试（`--force` 强制全量重试），失败清单只列近 7 天 |
 | 4a 附件下载 | `node "…/scripts/download_attachment.mjs" --pending` 或 `--records id1,id2` | 事务式（.part→校验→原子提交，目标存在绝不覆盖）；**并发 3**（CLI 冷启动占大头，串行慢 3 倍）；限流自动退避重试；完成自动合并推进 archived |
-| 4b 链接下载 | `node "…/scripts/batch_download_links.mjs" --records id1,id2`（不传=全部 verified 链接） | Playwright headless；失效自动标 blocked(LINK_EXPIRED)；完成自动合并。当天收简历**用 --records 精准下**。**大附件（≳50MB）默认不自动下载**：提醒用户手动下载到 Downloads，Agent 走手动归档（见下方"用户手动下载文件的归档"）；仅用户明确让 Agent 下载时才跑本脚本。**多个下载任务不并行收尾**：merge 是读-改-写 manifest，并行会互相覆盖状态——多批记录下载完统一跑一次 merge |
-| 5 合并 | `node "…/scripts/merge_results.mjs"` | 修复工具：并行进程 / 中断恢复时手动收尾（常规路径已自动合并） |
-| 6 脱敏+闸门 | `python "…/scripts/redact_salary.py" --dir <目录> [--report-json <p.json>]` → `python "…/scripts/verify_archive.py" <目录>` | **先脱敏再闸门**（顺序反了闸门必 STOP）；rar 自动转 zip 并删原包；**`.doc` 自动转 PDF（Word COM / soffice）后脱敏，转换成功自动删原 .doc**；闸门输出 `🟢 全过` 才进评估 |
+| 4b 链接下载 | `node "…/scripts/batch_download_links.mjs" --records id1,id2`（不传=全部 verified 链接） | Playwright headless；失效自动标 blocked(LINK_EXPIRED)；完成自动合并。当天收简历**用 --records 精准下**。**大附件（≳50MB）默认不自动下载**：提醒用户手动下载到 Downloads，Agent 走手动归档（见下方"用户手动下载文件的归档"）；仅用户明确让 Agent 下载时才跑本脚本 |
+| 5 合并 | `node "…/scripts/merge_results.mjs"` | 修复工具：中断恢复时手动收尾（常规路径已自动合并；并行收尾禁止，见反模式） |
+| 6 脱敏+闸门 | `python "…/scripts/redact_salary.py" --dir <目录> [--report-json <p.json>]` → `python "…/scripts/verify_archive.py" <目录>` | **先脱敏再闸门**（顺序反了闸门必 STOP）；rar 自动转 zip 并删原包；**`.doc` 自动转 PDF（Word COM / soffice）后脱敏，转换成功自动删原 .doc**；闸门输出 `🟢 全过` 才进评估。批量跑闸门时目录会被自动收敛改名（`_暂定`→`_N份`），报"没找到简历"先 ls 确认实际目录名再重跑 |
 
 单文件特殊场景（批量模式覆盖不到时）：
 
@@ -106,7 +106,7 @@ collect 只自动处理"唯一匹配"，以下决策归 Agent/用户：
 # rar 转规范命名 zip（--output 必须绝对路径）
 python "…/scripts/redact_salary.py" <简历.rar> --output "F:/…/姓名_岗位_年限_简历加作品.zip"
 # 图片型简历（jpg/图片型PDF，7z 包内图片简历先解出）薪酬脱敏一条命令
-python "…/scripts/redact_image_salary.py" <简历.jpg|图片型.pdf>   # OCR 前3页定位→白块覆盖→输出验证图复核
+python "…/scripts/redact_image_salary.py" <简历.jpg|图片型.pdf>   # 定位命中块→白块→输出验证图复核
 # 图片型 PDF 主会话视觉定位薪酬后传坐标
 python "…/scripts/redact_salary.py" <图片型.pdf> --redact-rects '[{"page":1,"dpi":200,"bbox":[x,y,x,y]}]'
 ```

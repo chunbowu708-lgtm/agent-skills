@@ -4,7 +4,7 @@ generate_dashboard.py — 招聘管道看板 HTML 生成器（v2 重写 2026-08-
 
 读 _daily_review.json → 按工作室分组 → 岗位漏斗色块 + 推送提醒 + 停滞预警 → 输出 HTML 看板。
 纯数据聚合 + 渲染，不调 AI。
-数据契约见 recruit-followup/references/review-contract.md：人员主数据在 structured.ats。
+数据契约见 daily-recruit-report/references/review-contract.md：人员主数据在 structured.ats。
 
 v2 变更（对抗式审查结论）：
   - 按 dept（工作室）分组卡片，不再一张扁平表

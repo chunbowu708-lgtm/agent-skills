@@ -78,11 +78,15 @@ def _zip_decode_name(info):
 
 
 def find_date_dirs(archive_root, date_prefix):
-    """找到所有 {date_prefix}_*份 目录（含档位子目录）。"""
+    """找到所有 {date_prefix}_*份 和 {date_prefix}_暂定 目录（含档位子目录）。
+
+    也扫 _暂定：resolve 后、闸门 rename 前的简历在 _暂定 里，
+    不扫会漏人（2026-08-13 林先生案例：在 _暂定 时 collect 没扫到）。
+    """
     results = []
     for root, dirs, files in os.walk(archive_root):
         for d in dirs:
-            if d.startswith(f"{date_prefix}_") and d.endswith("份"):
+            if d.startswith(f"{date_prefix}_") and (d.endswith("份") or d.endswith("暂定")):
                 results.append(os.path.join(root, d))
     return results
 
@@ -93,7 +97,11 @@ def is_resume_file(filename):
     if ext not in RESUME_EXTS:
         return False
     name_lower = filename.lower()
-    # 独立作品集文件跳过（如 xxx_作品集.pdf）
+    # 文件名含"简历"（含"简历加作品/简历和作品集"等）→ 视为简历文件
+    # 否则含作品关键词（xxx_作品集.pdf）→ 跳过
+    # 2026-08-17 谢平鑫 case：_简历加作品.pdf 被"作品"关键词误跳过，漏评估
+    if "简历" in name_lower:
+        return True
     if any(kw in name_lower for kw in PORTFOLIO_KEYWORDS):
         return False
     return True
@@ -155,7 +163,9 @@ def extract_resume_text(filepath):
     if ext == ".pdf":
         text, is_valid, issue = extract_pdf(filepath)
         render = None
-        if not is_valid and issue and ("BOSS" in issue or "扫描件" in issue or "图片PDF" in issue):
+        # 提取失败/无效 → 自动渲染图片（不依赖 issue 关键词，任何失败都渲染兜底）
+        # 2026-08-13 教训：issue=None 但 is_valid 不为 True 时也要渲染（林先生案例）
+        if not is_valid or len(text.strip()) < 50:
             try:
                 render = render_pages(filepath)
             except Exception:
@@ -336,6 +346,14 @@ def main():
         print(f"\n⚠️ 图片型简历（需人工看原件）：{', '.join(r['name'] for r in image_type)}")
     if portfolio_only:
         print(f"⚠️ 纯作品集无简历：{', '.join(r['name'] for r in portfolio_only)}")
+
+    # 加密PDF已渲染图片 → 强制提醒用视觉模型读（不靠记忆，2026-08-13 教训）
+    render_candidates = [r for r in results if r.get("render_pages")]
+    if render_candidates:
+        print(f"\n🚨 {len(render_candidates)} 人是加密PDF已渲染图片，必须用视觉模型(analyze_image)读 render_pages 后写回 JSON text 字段，否则无法评估：")
+        for r in render_candidates:
+            pages = r.get("render_pages", [])
+            print(f"  → {r['name']}（{r['job']}）: 渲染前 {len(pages)} 页（作品集超长页截断，核心信息在前几页）→ {output_dir}/{r['name']}.json 的 render_pages 字段")
 
 
 if __name__ == "__main__":

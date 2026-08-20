@@ -96,6 +96,26 @@ MSYS_NO_PATHCONV=1 lark-cli api POST /open-apis/hire/v1/applications \
 
 **唯一正确接口**：`PUT /applications/{id}` 不存在会 404。调后 `active_status` 变 2，对账脚本自动过滤。
 
+### POST /open-apis/hire/v1/applications/{id}/recover
+
+恢复已终止投递（2026-08-18 新增）。无请求体。
+
+**封装**：`_lark_shared.hire_recover_application(application_id) -> dict`
+
+**⚠️ 写操作，逐案经用户确认后才能调**。比 terminate 后重建投递更优：保住原投递的历史面试记录/阶段流转。
+
+**前置条件**：投递已终止、人才未入职、未锁定在其他投递。
+
+**错误码**（封装已映射成中文提示）：
+
+| code | 含义 |
+|---|---|
+| 1002225 | 投递未终止（本来就活跃，无需恢复） |
+| 1002210 | 人才已被其他投递锁定 |
+| 1002206 | 存在相似投递 |
+| 1002209 | 人才已入职 |
+| 1002201 | 投递不存在 |
+
 ## Job
 
 ### GET /open-apis/hire/v1/jobs
@@ -119,11 +139,11 @@ MSYS_NO_PATHCONV=1 lark-cli api GET /open-apis/hire/v1/jobs \
 
 ### GET /open-apis/hire/v1/interviews
 
-列面试（含面评结论）。
+列面试（含面评结论）。`application_id` / `interview_id` / `start_time` / `end_time`(毫秒) 四个过滤参数不许同时为空，`page_size≤100`，默认 `user_id_type=open_id`（`interview_record_list[].interviewer.id` 即 open_id）。
 
-**封装**：`_lark_shared.hire_list_interviews(application_id) -> list[dict]`
+**封装**：`_lark_shared.hire_list_interviews(application_id) -> list[dict]`（按投递列）
 
-**参数**：`application_id`（必填）
+**封装**：`_lark_shared.hire_get_interview_by_id(interview_id) -> dict`（按面试 ID 查单个，返回 `{}`=查不到）
 
 **关键返回**：`data.items[].interview_record_list[].conclusion` — `1`通过 / `2`不通过 / 空=未提交面评。
 
@@ -131,6 +151,20 @@ MSYS_NO_PATHCONV=1 lark-cli api GET /open-apis/hire/v1/jobs \
 MSYS_NO_PATHCONV=1 lark-cli api GET /open-apis/hire/v1/interviews \
   --as bot --params '{"application_id":"7092356709288453","page_size":10}'
 ```
+
+### GET /open-apis/hire/v1/interview_tasks
+
+按面试官查面试任务（**催面评权威数据源**，2026-08-18 实测可用）。scope=`hire:interview:readonly`，`page_size≤20`。
+
+**封装**：`_lark_shared.hire_list_interview_tasks(user_id, activity_status=None) -> list[dict]`
+
+**参数**：`user_id`（面试官 open_id，必填）、`activity_status`（1未开始/2未评价/3已评价/5已终止，催面评传 2）。
+
+**返回 items**：`{id(面试ID), job_id, talent_id, application_id, activity_status}`。⚠️ 无时间字段——"拖了几天"要用 `application_id` 查 interviews 或 `interview_id` 走 `hire_get_interview_by_id`。
+
+**消费方**：`_daily_review.py::fetch_interviewer_debt` 聚合成 `interviewer_feedback_debt`（对账契约）。
+
+> 面试官枚举：官方 `GET /interviewers` 列表没用（只返回执行过"更新面试官信息"操作的用户，实测 0 条）。用 `notes/interviewers.json` 缓存 ∪ 面试记录 `interviewer.id` 反查。
 
 ### GET /open-apis/hire/v2/interview_records/{record_id}
 
@@ -150,6 +184,32 @@ MSYS_NO_PATHCONV=1 lark-cli api GET /open-apis/hire/v1/interviews \
 MSYS_NO_PATHCONV=1 lark-cli api GET /open-apis/hire/v1/interview_records/attachments \
   --as bot --params '{"application_id":"APP_ID","interview_record_id":"REC_ID"}'
 ```
+
+## 招聘任务/评估（2026-08-18 hire:evaluation:readonly 开通后可用）
+
+### GET /open-apis/hire/v1/evaluation_tasks
+
+按评估人查简历评估任务（谁欠评简历）。`page_size≤20`，`user_id` 必填。
+
+**封装**：`_lark_shared.hire_list_evaluation_tasks(user_id, activity_status=None) -> list[dict]`
+
+**activity_status**：1待评估 / 2已评估 / 3无需评估（催评估传 1）。
+
+**返回 items**：`{id, job_id, talent_id, application_id, activity_status}`。
+
+### GET /open-apis/hire/v1/evaluations
+
+查简历评估列表（业务评估结论 API 直读，不再从阶段流转反推）。`page_size≤100`。
+
+**封装**：`_lark_shared.hire_list_evaluations(application_id=None, update_start_time=None) -> list[dict]`
+
+**参数**：`application_id`（投递过滤）、`update_start_time`（毫秒时间戳，最早更新时间）。
+
+**返回 items**：`{id, application_id, evaluator_id, commit_status(1已提交/2未提交), conclusion(1通过/2未通过，未提交时null), content(评语), create_time, update_time}`。枚举映射在 `_lark_shared.EVALUATION_CONCLUSION_ZH / EVALUATION_TASK_STATUS_ZH`。
+
+**消费方**：`_daily_review.py::fetch_evaluations_data` → `pending_evaluations`（未提交预警）+ ats 的 `evaluation_conclusion` join。
+
+> `GET /todos` 待办接口不封装：只认 user_access_token（tenant 恒 99991663），`user_id` 参数无效（只能查登录用户自己的待办）。评估/面评/offer 三维已被本节 + interview_tasks + offers 覆盖。
 
 ## Attachment
 

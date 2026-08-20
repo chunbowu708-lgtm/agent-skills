@@ -1,7 +1,7 @@
 ---
 name: candidate-nurture
 description: >
-  recruit-followup 的后半场（不独立运行，前置 gate 见 SKILL 顶部）。读其对账产出的预警数据（停滞/面评欠收/待推进）
+  daily-recruit-report 的后半场（不独立运行，前置 gate 见 SKILL 顶部）。读其对账产出的预警数据（停滞/面评欠收/待推进）
   + 信号文件（LLM判读的邀约/拒绝+用户决策）+ 保温状态文件（谁碰过几次/该不该升级），
   产出"今天该碰谁 + 怎么碰（话术）"的行动清单，并记录触达状态形成闭环，防候选人静默流失。
   触发词：保温、候选人保温、催面评、面评催收、谁该跟进、停滞预警、候选人冷了、跟进提醒。
@@ -9,7 +9,8 @@ description: >
   覆盖：面评催收清单、停滞候选人保温提醒、阶段化保温话术、话术升级、触达状态跟踪、信号交叉比对。
   不覆盖：自动发消息给候选人（只给话术，人工发）、面试时间协调（见schedule-interview）、简历筛选（见analyze-resumes）。
   依赖：
-    - notes/_daily_review.json（每日对账产出，含stuck/to_advance/feedback_overdue，契约见 recruit-followup/references/review-contract.md）
+    - notes/_daily_review.json（每日对账产出，含stuck/to_advance/feedback_overdue/
+      interviewer_feedback_debt/pending_evaluations，契约见 daily-recruit-report/references/review-contract.md）
     - notes/_signals.json（Agent判读的邀约/拒绝信号+用户决策，契约见 references/signals-contract.md）
     - notes/_nurture_state.json（保温触达状态，本skill的 nurture_state.py 维护）
     - 面评全文（可选，催面评时引用具体内容）
@@ -19,11 +20,11 @@ description: >
 
 ## 前置 gate（开局第一动作，不可跳过）
 
-本 skill 是 **recruit-followup 的后半场**，不独立产出数据。开局先校验数据就绪：
+本 skill 是 **daily-recruit-report 的后半场**，不独立产出数据。开局先校验数据就绪：
 
 1. 读 `notes/_daily_review.json`，校验顶层 `date == 今天`。
 2. 读 `notes/_signals.json`，校验顶层 `date == 今天`。
-3. 任一不存在或非当天 → **停止，不产出任何清单**。告知用户：「保温是 recruit-followup 的后半场。请先执行早晨对账（`python notes/_daily_review.py`）并完成意图判读/决策全流程，再唤起保温。」
+3. 任一不存在或非当天 → **停止，不产出任何清单**。告知用户：「保温是 daily-recruit-report 的后半场。请先执行早晨对账（`python notes/_daily_review.py`）并完成意图判读/决策全流程，再唤起保温。」
 4. 两文件均为当天 → 继续。
 
 不降级、不兜底、不产出残缺清单。
@@ -32,13 +33,13 @@ description: >
 
 招聘的本质是"把人留住"。`_daily_review.py` 已算出谁该跟进，本 skill 补上配套的"今天该碰谁 + 用什么话术碰"。
 
-## 与 recruit-followup 的边界
+## 与 daily-recruit-report 的边界
 
 | 能力 | 归属 | 说明 |
 |------|------|------|
-| 算预警数据（停滞/欠收/待推进） | **recruit-followup**（`_daily_review.py`） | 本skill**只读**其产出 `_daily_review.json` |
-| LLM判读群消息意图 + 落盘 | **recruit-followup**（Agent执行） | 判读后写入 `_signals.json`，本skill只读 |
-| 早晨决策落盘 | **recruit-followup**（Agent执行） | 用户决策后Agent更新 `_signals.json` 的 decisions |
+| 算预警数据（停滞/欠收/待推进） | **daily-recruit-report**（`_daily_review.py`） | 本skill**只读**其产出 `_daily_review.json` |
+| LLM判读群消息意图 + 落盘 | **daily-recruit-report**（Agent执行） | 判读后写入 `_signals.json`，本skill只读 |
+| 早晨决策落盘 | **daily-recruit-report**（Agent执行） | 用户决策后Agent更新 `_signals.json` 的 decisions |
 | 产出"今天该碰谁+话术" | **本skill** | 读三路数据 → 匹配话术 → 行动清单 |
 | 记录保温触达状态 | **本skill**（`nurture_state.py`） | 触达后写 `_nurture_state.json`，跨天延续 |
 | 发消息给候选人 | **人工** | 本skill只给话术，不自动发 |
@@ -46,7 +47,8 @@ description: >
 ## 工作流
 
 ```
-① 读预警数据     读 _daily_review.json 的 structured.stuck / feedback_overdue / to_advance
+① 读预警数据     读 _daily_review.json 的 structured.stuck / feedback_overdue /
+                 interviewer_feedback_debt / pending_evaluations / to_advance
     ↓
 ①.3 读信号数据   读 _signals.json（LLM判读的邀约/拒绝 + 用户早晨决策）
     ↓
@@ -74,16 +76,18 @@ python -c "
 import json
 d = json.load(open('notes/_daily_review.json', encoding='utf-8'))
 s = d['structured']
-for k in ['feedback_overdue','stuck','to_advance']:
+for k in ['feedback_overdue','interviewer_feedback_debt','pending_evaluations','stuck','to_advance']:
     print(k, len(s.get(k,[])))
 "
 ```
 
-**三类预警数据**（`_daily_review.json` → `structured`，字段契约见 review-contract.md）：
+**五类预警数据**（`_daily_review.json` → `structured`，字段契约见 review-contract.md）：
 
 | 数据 | 含义 | 流失风险 |
 |------|------|---------|
-| `feedback_overdue` | 面试已过但面试官没交面评 | 🔴 高（候选人等结果，拖久=凉） |
+| `feedback_overdue` | 面试已过但面试官没交面评（候选人视角，最新一场） | 🔴 高（候选人等结果，拖久=凉） |
+| `interviewer_feedback_debt` | **面试官欠面评聚合**（interview_tasks API）：每人欠评数/陈年数/最久拖几天/池内阻塞者 | 🔴 高（重欠面试官=批量卡流程，零星私聊催不动） |
+| `pending_evaluations` | 简历评估发起后一直没提交（evaluations API，commit_status=2） | 🟡 中（评估卡住→阶段流转不动） |
 | `stuck` (dwell≥2天) | 卡在某阶段无进展 | 🟠 中高（看卡几天，≥5天=高危） |
 | `to_advance` | 面评通过但没推进下一轮 | 🟡 中（候选人觉得"面了没下文"） |
 
@@ -91,7 +95,7 @@ for k in ['feedback_overdue','stuck','to_advance']:
 
 ## 阶段1.3：读信号数据（交叉比对 LLM 判读 + 用户决策）
 
-> 数据来源：`notes/_signals.json`（recruit-followup 早晨对账时 Agent 判读 + `signals.py` 落盘）
+> 数据来源：`notes/_signals.json`（daily-recruit-report 早晨对账时 Agent 判读 + `signals.py` 落盘）
 > 契约：[`references/signals-contract.md`](references/signals-contract.md)
 
 读两个列表：
@@ -148,7 +152,7 @@ python "…/candidate-nurture/scripts/nurture_state.py" --stale
 | 阶段 | 含义 | blocker | 动作对象 | 数据来源 |
 |------|------|---------|----------|----------|
 | **① 邀约未落地** | 业务说约但没约成 | 你自己 | 录入ATS+约时间 | signals type=invite, ats_landed=false |
-| **② 面试欠面评** | 面完了面试官没交 | **面试官** | 催面试官（不是碰候选人）| feedback_overdue（带面试官字段）|
+| **② 面试欠面评** | 面完了面试官没交 | **面试官** | 催面试官（不是碰候选人）| feedback_overdue（候选人视角）+ interviewer_feedback_debt（面试官聚合，重欠升级用）|
 | **③ 面评通过待推进** | 面评过了流程没动 | 你自己/Bruce | 推进下一轮 or 走offer | to_advance |
 | **④ offer 推进卡住** | 业务确认offer但ATS没转 | Bruce/Tina | 催Bruce/Tina+保温候选人 | signals type=invite + stage=面试+终试通过 |
 | **⑤ 待入职流失风险** | 接了offer没入职 | HR/入职流程 | 确认入职+保温 | stage=待入职/Offer沟通 |
@@ -179,7 +183,9 @@ python "…/candidate-nurture/scripts/nurture_state.py" --stale
 ```
 
 **同梯队内排序**：按 dwell_days 降序（卡得越久越优先）。
-**同 blocker 合并**：同一面试官欠多人面评 → 合并成一条消息催（如涂萍欠裴偲宇+曾桥）。
+**同 blocker 合并**：同一面试官欠多人面评 → 合并成一条消息催（如涂萍欠裴偲宇+曾桥）。合并时以 `interviewer_feedback_debt[].in_scope` 为准（阻塞者名单，已滤旧轮僵尸）。
+**重欠升级（interviewer_feedback_debt）**：面试官非陈年积欠（`pending_count − ancient_count`）≥10 条，或池内阻塞 ≥2 人 → 零星私聊已不够，队列单独标一条"建议业务群/leader 层面推"，附数据（欠 N 条·最久拖 N 天·其中阻塞我 N 人）。话术随场合升级：私聊礼貌催 → 群里@点名 → leader 层面推。
+**评估未提交（pending_evaluations）**：欠 ≥3 天 → 催评估人提交（或判无需评估）；欠 ≥30 天 → 先问业务"还评不评"，不评就流转面试或终止，评估挂着只会阻塞阶段。
 
 ### 过滤规则（排优先级后应用）
 
@@ -328,8 +334,8 @@ python "…/candidate-nurture/scripts/nurture_state.py" \
 ## 不做的事（显式边界）
 
 - ❌ **不自动发消息**——只给话术+渠道建议，人工发（措辞+时机需人把关）
-- ❌ **不算预警数据**——读 `_daily_review.json`，不重新算（那是 recruit-followup 的活）
-- ❌ **不做 LLM 消息判读**——读 `_signals.json`（recruit-followup 判读后落盘的），不自己判读 raw_messages
+- ❌ **不算预警数据**——读 `_daily_review.json`，不重新算（那是 daily-recruit-report 的活）
+- ❌ **不做 LLM 消息判读**——读 `_signals.json`（daily-recruit-report 判读后落盘的），不自己判读 raw_messages
 - ❌ **不替用户做终止决策**——长期停滞的，提示用户判断，不自动终止；用户决定后调 `--reset`
 - ❌ **不碰面评内容分析**——催面评只催"提交"，面评内容分析是 talent-review 的活
 - ✅ **会记录触达状态**——用户执行后调 `nurture_state.py --touch`，使保温跨天延续（这是新增能力，之前不记录）

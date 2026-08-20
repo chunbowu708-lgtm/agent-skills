@@ -14,6 +14,8 @@ nurture_state.py — 候选人保温状态管理器
 
 依赖：无第三方包，纯 json + argparse。
 """
+
+import os
 import json, os, argparse, datetime
 
 # ============================================================

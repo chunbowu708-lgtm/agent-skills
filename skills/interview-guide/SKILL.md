@@ -7,7 +7,7 @@ description: >
   **用户说"面试话术/面试安排/面试时间"默认指约面试时间草稿（schedule-interview），不是本 skill**——本 skill 只管"考什么/问什么"。
   只要用户提到"面试问题/考核维度/考察重点/面试准备/给面试官"，就使用这个skill。
   覆盖：4轮面试的考察重点、行为面试问题（讲一个你过去...）、情境面试问题（如果遇到...你会）、针对简历薄弱点的追问。
-  不覆盖：简历评估（见analyze-resumes）、JD优化（见jd-craft）、安排面试时间/约面试/面试时间草稿（见schedule-interview）、读面评内容（见recruit-followup）。
+  不覆盖：简历评估（见analyze-resumes）、JD优化（见jd-craft）、安排面试时间/约面试/面试时间草稿（见schedule-interview）、读面评内容（见 daily-recruit-report，接口见 lark-hire）。
   依赖：jd-optimized.md（硬卡项/职责）、评估要点.md（真实看重什么/雷区）、候选人简历（薄弱点）。
 ---
 
